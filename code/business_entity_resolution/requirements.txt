@@ -1,0 +1,12 @@
+# Freeze exact versions with `pip freeze` once your environment works (required for submission).
+pandas
+pyarrow
+numpy<2            # fasttext-wheel breaks on numpy 2.x
+tqdm
+unidecode
+rapidfuzz          # Jaro-Winkler etc. (EDA, later pair features)
+fasttext-wheel     # IndicLID native-script model (FTN)
+
+# Only for --backend indicxlit (heavy; on Windows use WSL2 / Colab / Kaggle):
+# torch
+# ai4bharat-transliteration
