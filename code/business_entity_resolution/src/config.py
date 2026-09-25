@@ -59,5 +59,10 @@ KEYGEN_BLOCK = 500_000     # records turned into hashed keys at a time
 WITHIN_COUNTRY = True      # block inside country_norm (set False if EDA shows cross-country matches)
 
 
+# ---- Stage 3b: supervised meta-blocking (prune.py) ----
+PRUNE_RECALL = 0.995       # keep this share of the true pairs blocking found (threshold chosen out-of-fold)
+PRUNE_MAX_THR = 0.05       # never prune harder than this probability
+
+
 def candidates_dir(split: str):
     return PROCESSED_DIR / f"candidates_{split}"
