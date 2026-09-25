@@ -2,6 +2,7 @@
 
 Nothing here is destructive: callers keep the raw column and add derived columns.
 """
+import html
 import re
 import unicodedata
 from functools import lru_cache
@@ -38,14 +39,48 @@ def script_of(ch: str) -> str:
     return "Othr"
 
 
+# Mojibake: UTF-8 bytes decoded as Latin-1/cp1252 ('â\x80\x99' for "'", 'Ã©' for 'é'), sometimes
+# uppercased afterwards ('Â\x80\x93' for '–'). A lead char + 1-2 continuation chars is re-encoded
+# to bytes and decoded as UTF-8; unrecoverable runs become a space (never a stray letter).
+_CP1252_CONT = "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ"
+_MOJIBAKE = re.compile(f"[ÂâÃã][\u0080-\u00bf{_CP1252_CONT}]{{1,2}}")
+_LEADS = {"Â": (0xE2, 0xC2), "â": (0xE2, 0xC2), "Ã": (0xC3, 0xE3), "ã": (0xC3, 0xE3)}
+
+
+def _byte(ch):
+    o = ord(ch)
+    return o if o < 256 else ch.encode("cp1252")[0]
+
+
+def _unmojibake(m):
+    run = m.group(0)
+    cont = bytes(_byte(c) for c in run[1:])
+    for lead in _LEADS[run[0]]:
+        try:
+            return (bytes([lead]) + cont).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return " "
+
+
+def repair_text(t: str) -> str:
+    """HTML entities and mojibake -> the intended characters (no-op on clean text)."""
+    if "&" in t and ";" in t:
+        t = html.unescape(t)
+    if not t.isascii() and _MOJIBAKE.search(t):
+        t = _MOJIBAKE.sub(_unmojibake, t)
+    return t
+
+
 def normalize(text) -> str:
-    """NFKC, casefold, punctuation/symbols -> space, native digits -> ASCII.
+    """Repair (HTML entities, mojibake), NFKC, casefold, punctuation/symbols -> space,
+    native digits -> ASCII, invisible format characters (Cf: soft hyphen, bidi marks) deleted.
 
     Keeps letters and combining marks (needed for Indic scripts) and all digits.
     """
     if text is None or text != text:  # None / NaN
         return ""
-    t = unicodedata.normalize("NFKC", str(text)).translate(_ZERO_WIDTH)
+    t = unicodedata.normalize("NFKC", repair_text(str(text))).translate(_ZERO_WIDTH)
     if t.isascii():  # fast path: most US rows
         return _ASCII_NON_ALNUM.sub(" ", t.lower().replace("&", " and ")).strip()
     out = []
@@ -55,6 +90,8 @@ def normalize(text) -> str:
             out.append(" and ")
         elif cat == "Nd":
             out.append(str(unicodedata.decimal(ch)))
+        elif cat == "Cf":                 # invisible format chars: delete, don't split the word
+            continue
         elif cat[0] in "PSZC":
             out.append(" ")
         else:
