@@ -2,3 +2,12 @@ dataset/
 eda/
 code.zip
 utils.zip
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.log
+code/business_entity_resolution/logs/
+models/
+output/*.tsv
+submission.zip

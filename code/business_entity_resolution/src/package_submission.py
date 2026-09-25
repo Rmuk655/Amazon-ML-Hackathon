@@ -21,7 +21,7 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 CODE = os.path.join(ROOT, "code", "business_entity_resolution")
-SKIP_DIRS = {"__pycache__", ".ipynb_checkpoints", ".git", "venv", ".venv"}
+SKIP_DIRS = {"__pycache__", ".ipynb_checkpoints", ".git", "venv", ".venv", "logs"}
 SKIP_EXT = {".pyc", ".parquet", ".joblib", ".bin", ".zip", ".pkl"}
 MAX_CODE_FILE_MB = 5
 
@@ -74,7 +74,7 @@ def check_candidates(path, match_pairs):
     if df.shape[1] < 2:
         err("candidate_pairs.tsv needs at least two columns")
         return
-    cand = set(zip(df.iloc[:, 0], df.iloc[:, 1]))
+    cand = {(a, x) for a, b in zip(df.iloc[:, 0], df.iloc[:, 1]) for x in b.split(",") if x}
     ok(f"{len(cand):,} distinct candidate pairs")
     if match_pairs:
         missing = match_pairs - cand
@@ -121,6 +121,14 @@ def main():
         pairs = check_matching(mr)
     if os.path.exists(cp):
         check_candidates(cp, pairs)
+
+    print("== official validator (utils/validate_submission.py) ==")
+    import subprocess
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "utils", "validate_submission.py"),
+                        "--matching", mr, "--candidate", cp,
+                        "--test-dir", os.path.join(ROOT, "dataset", "test")], cwd=ROOT)
+    if r.returncode != 0:
+        err("official validator FAILED (see its output above)")
 
     print("== code ==")
     for rel in ("README.md", "requirements.txt", "src"):

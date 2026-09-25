@@ -32,14 +32,16 @@ import pyarrow.parquet as pq
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 
+import config as C
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))  # .../student_resource
 # Short internal feature-column names -> actual column names written by preprocess.py.
-TEXT_COLS = ["name_norm", "name_rom", "addr_norm", "addr_rom", "country_norm"]
+TEXT_COLS = ["name_norm", "name_rom", "addr_norm", "addr_rom", "country_norm", "core"]
 COL_MAP = {
     "name_norm": "business_name_norm", "name_rom": "business_name_rom",
     "addr_norm": "business_address_norm", "addr_rom": "business_address_rom",
-    "country_norm": "country_norm",
+    "country_norm": "country_norm", "core": "business_name_c4b",
 }
 ID_CANDIDATES = ["entity_id", "id", "source_entity_id", "record_id", "uid"]
 RESERVED = {"s1_id", "cand_id", "src", "is_true"}
@@ -143,19 +145,24 @@ def detect_id(cols, override=None):
 
 def find_processed(split, overrides):
     found = dict(overrides)
-    pat = re.compile(r"(?:^|[^a-z0-9])(?:s|source_?)([123])(?:[^0-9]|$)")
-    for p in glob.glob(os.path.join(ROOT, "dataset", "processed", "**", "*.parquet"), recursive=True):
-        rel = os.path.relpath(p, ROOT).lower()
-        if "candidates_" in rel or split not in rel:
-            continue
-        m = pat.search(os.path.basename(p).lower())
-        if m and int(m.group(1)) not in found:
-            found[int(m.group(1))] = p
+    for n in (1, 2, 3):
+        if n not in found and C.processed_path(split, n).exists():
+            found[n] = str(C.processed_path(split, n))
     missing = [s for s in (1, 2, 3) if s not in found]
     if missing:
         raise SystemExit(f"Could not locate processed parquet for source(s) {missing}. "
                          f"Use --proc-file 1=path 2=path 3=path")
     return found
+
+
+def load_tables(procs, need, id_override=None):
+    """S1/S2/S3 tables restricted to `need` ids, plus core-name counts over the WHOLE S1 file
+    (chain-name ambiguity: how many S1 entities share a core name)."""
+    tabs = {s: load_table(procs[s], need, id_override) for s in (1, 2, 3)}
+    col = COL_MAP["core"]
+    tabs["core_counts"] = (pd.read_parquet(procs[1], columns=[col])[col].fillna("").value_counts()
+                           if col in pq.ParquetFile(procs[1]).schema_arrow.names else pd.Series(dtype=int))
+    return tabs
 
 
 def load_table(path, need_ids, id_override=None):
@@ -193,7 +200,7 @@ def read_cand_file(path, frac=1.0):
 
 
 def cand_files(split):
-    files = sorted(glob.glob(os.path.join(ROOT, "dataset", "processed", f"candidates_{split}", "*.parquet")))
+    files = sorted(glob.glob(str(C.candidates_dir(split) / "*.parquet")))
     if not files:
         raise SystemExit(f"No candidate parquet files for split '{split}'. Run blocking.py first.")
     return files
@@ -230,6 +237,20 @@ def compute_features(c, tabs, workers, chunk=100_000):
             X[m] = np.vstack(res)
     F = pd.DataFrame(X, columns=FEATS)
     F["srcn"] = c["srcn"].values
+    # chain-name ambiguity: a target whose core name is shared by many S1 entities is risky
+    cc = tabs.get("core_counts")
+    if cc is not None and len(cc):
+        def core_at(tab, pos):                  # pos -1 = id not loaded -> ""
+            v = tab.cols["core"][np.maximum(pos, 0)] if len(tab.index) else np.array([""] * len(pos), dtype=object)
+            return np.where(pos >= 0, v, "")
+        core_a = pd.Series(core_at(tabs[1], ia), dtype=object)
+        core_b = pd.Series([""] * n, dtype=object)
+        for s in (2, 3):
+            m = np.where(c["srcn"].values == s)[0]
+            core_b.iloc[m] = core_at(tabs[s], tabs[s].pos(c["cand_id"].values[m]))
+        F["amb_s1_core_freq"] = core_a.map(cc).fillna(0).values.astype(np.float32)
+        F["amb_t_core_freq"] = core_b.map(cc).fillna(0).values.astype(np.float32)
+        F["amb_core_eq"] = (core_a.values == core_b.values) & (core_a.values != "")
     for col in c.columns:
         if col not in RESERVED and col != "srcn" and pd.api.types.is_numeric_dtype(c[col]):
             F["blk_" + col] = c[col].values
@@ -240,9 +261,10 @@ def compute_features(c, tabs, workers, chunk=100_000):
 def make_model():
     try:
         import lightgbm as lgb
-        return lgb.LGBMClassifier(n_estimators=800, learning_rate=0.05, num_leaves=63, subsample=0.8,
+        return lgb.LGBMClassifier(n_estimators=1500, learning_rate=0.05, num_leaves=63, subsample=0.8,
                                   subsample_freq=1, colsample_bytree=0.8, min_child_samples=40,
-                                  reg_lambda=1.0, verbose=-1), True
+                                  reg_lambda=1.0, max_bin=63, force_col_wise=True, n_jobs=-1,
+                                  verbose=-1), True
     except ImportError:
         from sklearn.ensemble import HistGradientBoostingClassifier
         return HistGradientBoostingClassifier(max_iter=400, learning_rate=0.06, max_leaf_nodes=63), False
@@ -252,41 +274,199 @@ def best_threshold(y, p):
     from sklearn.metrics import precision_recall_curve
     if y.sum() == 0:
         return 0.5
+    # leaderboard metric is F0.5 (precision-weighted), so tune for it, not F1
     pr, rc, th = precision_recall_curve(y, p)
-    f1 = 2 * pr[:-1] * rc[:-1] / np.maximum(pr[:-1] + rc[:-1], 1e-9)
-    return float(th[int(np.argmax(f1))])
+    b2 = 0.25
+    f = (1 + b2) * pr[:-1] * rc[:-1] / np.maximum(b2 * pr[:-1] + rc[:-1], 1e-9)
+    return float(th[int(np.argmax(f))])
 
 
-def decide(d, p, thr, fallback, exclusive, low_frac=0.5):
-    """d: DataFrame with s1_id, cand_id, srcn. Returns boolean keep mask (aligned to d)."""
-    x = pd.DataFrame({"s1": d["s1_id"].values, "c": d["cand_id"].values, "s": d["srcn"].values, "p": p})
-    t = x["s"].map(thr).fillna(0.5).values
-    keep = x["p"].values >= t
-    x["keep"] = keep
-    if fallback:
-        g = x.groupby(["s1", "s"])
-        best = g["p"].transform("max").values
-        anyk = g["keep"].transform("any").values
-        x["keep"] = keep | (~anyk & (x["p"].values == best) & (x["p"].values >= t * low_frac))
-    if exclusive:
-        k = x[x["keep"]].sort_values("p", ascending=False).drop_duplicates(["s", "c"])
-        m = np.zeros(len(x), dtype=bool)
-        m[k.index.values] = True
-        x["keep"] = m
-    return x["keep"].values
+def thr_of(thr, s, am):
+    """Threshold for source s / address-missing flag am; falls back to the per-source value."""
+    return thr.get((int(s), int(am)), thr.get(int(s), 0.5))
 
 
-def prf(y, keep):
-    tp = int((y & keep).sum())
-    fp = int((~y & keep).sum())
-    fn = int((y & ~keep).sum())
-    p = tp / max(tp + fp, 1)
-    r = tp / max(tp + fn, 1)
-    return p, r, 2 * p * r / max(p + r, 1e-9)
+class Decider:
+    """Decision layer with everything threshold-independent precomputed, so the rule/threshold
+    search can evaluate hundreds of settings quickly. Same rules as before:
+      thresholds per (source, address-missing) | top-1 fallback per (S1, source) at t*low_frac |
+      margin: a pair must lead the best competing S1 for its target by >= margin |
+      exclusive: each target keeps only its highest-probability S1."""
+
+    def __init__(self, d, p, low_frac=0.5):
+        self.p = np.asarray(p, np.float64)
+        self.s = np.asarray(d["srcn"].values, int)
+        am = d["a_missing"].fillna(0).values if "a_missing" in d else np.zeros(len(d))
+        self.am = (np.asarray(am) > 0).astype(int)
+        self.low = low_frac
+        s1 = pd.Series(d["s1_id"].values).astype(str)
+        tg = pd.Series(d["cand_id"].values).astype(str)
+        self.g_ss = pd.factorize(s1 + "|" + self.s.astype(str))[0]
+        self.g_t = pd.factorize(tg + "|" + self.s.astype(str))[0]
+        x = pd.DataFrame({"g": self.g_ss, "t": self.g_t, "p": self.p})
+        self.is_best = self.p == x.groupby("g")["p"].transform("max").values
+        top1 = x.groupby("t")["p"].transform("max").values
+        n_top = (self.p == top1).astype(int)
+        n_top = pd.Series(n_top).groupby(self.g_t).transform("sum").values
+        sec = x["p"].where(self.p < top1).groupby(self.g_t).transform("max").fillna(0).values
+        self.lead = self.p - np.where((self.p == top1) & (n_top == 1), sec, top1)
+        self.perm = np.argsort(-self.p, kind="stable")
+
+    def compress(self, floor):
+        """Drop rows that no setting can keep (p < floor); competitor margins were already computed
+        on all rows. Calls then return a full-length mask. Makes the search ~n/n_kept faster."""
+        idx = np.where(self.p >= floor)[0]
+        sub = object.__new__(Decider)
+        for k in ("p", "s", "am", "g_ss", "g_t", "is_best", "lead"):
+            setattr(sub, k, getattr(self, k)[idx])
+        sub.low, sub.perm, sub.n_full, sub.idx = self.low, np.argsort(-sub.p, kind="stable"), len(self.p), idx
+        return sub
+
+    def __call__(self, thr, fallback, exclusive, margin=0.0):
+        keep = self._keep(thr, fallback, exclusive, margin)
+        if getattr(self, "idx", None) is None:
+            return keep
+        full = np.zeros(self.n_full, bool)
+        full[self.idx] = keep
+        return full
+
+    def _keep(self, thr, fallback, exclusive, margin=0.0):
+        lut = np.array([[thr_of(thr, s_, a_) for a_ in (0, 1)] for s_ in range(4)])
+        t = lut[np.clip(self.s, 0, 3), self.am]
+        keep = self.p >= t
+        if fallback:
+            anyk = np.bincount(self.g_ss, weights=keep, minlength=self.g_ss.max() + 1 if len(keep) else 0) > 0
+            keep = keep | (~anyk[self.g_ss] & self.is_best & (self.p >= t * self.low))
+        if margin > 0:
+            keep &= self.lead >= margin
+        if exclusive:
+            ks = self.perm[keep[self.perm]]
+            _, first = np.unique(self.g_t[ks], return_index=True)
+            keep = np.zeros(len(keep), bool)
+            keep[ks[first]] = True
+        return keep
+
+
+def decide(d, p, thr, fallback, exclusive, margin=0.0, low_frac=0.5):
+    """One-off decision (predict); see Decider."""
+    if len(d) == 0:
+        return np.zeros(0, bool)
+    return Decider(d, p, low_frac)(thr, fallback, exclusive, margin)
+
+
+def fbeta(p, r, b2=0.25):
+    return (1 + b2) * p * r / np.maximum(b2 * p + r, 1e-9)
+
+
+class MacroF05:
+    """Leaderboard metric: F0.5 per S1 entity, averaged over S1 entities; a singleton scores 1 for
+    an empty prediction and 0 otherwise. Built once, evaluated many times (bincount-fast).
+    n_true: optional {s1_id: #true matches} from ground truth, so matches blocking never proposed
+    still count as misses. extra_single / extra_other: S1 entities of the population that have
+    no candidate at all (they score 1 / 0) - gives the end-to-end estimate."""
+
+    def __init__(self, s1, y, n_true=None, extra_single=0, extra_other=0):
+        self.codes, uniq = pd.factorize(pd.Series(s1).astype(str))
+        self.G, self.y = len(uniq), np.asarray(y, bool)
+        true_c = np.bincount(self.codes, weights=self.y, minlength=self.G)
+        if n_true is not None:
+            true_c = np.maximum(true_c, pd.Series(uniq).map(n_true).fillna(0).to_numpy())
+        self.true, self.extra_single, self.extra_other = true_c, extra_single, extra_other
+
+    def __call__(self, keep):
+        keep = np.asarray(keep, bool)
+        tp = np.bincount(self.codes, weights=self.y & keep, minlength=self.G)
+        pred = np.bincount(self.codes, weights=keep, minlength=self.G)
+        per = np.where((pred == 0) & (self.true == 0), 1.0,
+                       fbeta(tp / np.maximum(pred, 1), tp / np.maximum(self.true, 1)))
+        P = tp.sum() / max(pred.sum(), 1)
+        R = tp.sum() / max(self.true.sum(), 1)
+        e2e = (per.sum() + self.extra_single) / (self.G + self.extra_single + self.extra_other)
+        return {"P": P, "R": R, "F0.5": float(fbeta(P, R)), "macro": float(per.mean()), "e2e": float(e2e)}
+
+
+def prf(y, keep, s1):
+    """(pooled P, R, F0.5, macro F0.5, macro F0.5 over non-singletons) within the candidate set."""
+    ev = MacroF05(s1, y)
+    m = ev(keep)
+    per_has = ev.true > 0
+    keep = np.asarray(keep, bool)
+    tp = np.bincount(ev.codes, weights=ev.y & keep, minlength=ev.G)
+    pred = np.bincount(ev.codes, weights=keep, minlength=ev.G)
+    per = fbeta(tp / np.maximum(pred, 1), tp / np.maximum(ev.true, 1))
+    mfx = float(per[per_has].mean()) if per_has.any() else float("nan")
+    return m["P"], m["R"], m["F0.5"], m["macro"], mfx
 
 
 # --------------------------------------------------------------------------- commands
+def fit_one(X, y, inner, w=None):
+    """Fit one model; LightGBM early-stops on the `inner` rows (a split of the training data)."""
+    model, is_lgb = make_model()
+    w = np.ones(len(y), np.float32) if w is None else w
+    if is_lgb:
+        import lightgbm as lgb
+        model.fit(X[~inner], y[~inner], sample_weight=w[~inner],
+                  eval_set=[(X[inner], y[inner])], eval_sample_weight=[w[inner]],
+                  eval_metric="average_precision", callbacks=[lgb.early_stopping(50, verbose=False)])
+    else:
+        model.fit(X, y, sample_weight=w)
+    return model
+
+
+def train_sample(X, y, h):
+    """Keep every positive and every hard negative; keep easy negatives at rate NEG_RATE with
+    weight 1/NEG_RATE (probabilities stay on the original scale). Deterministic via hash h."""
+    hard = y | (X["n_best"].fillna(0).values >= HARD_NEG_SIM)
+    if "blk_rank" in X:
+        hard |= X["blk_rank"].fillna(127).values < 2        # the S1's own top key-blocking candidates
+    easy_keep = ((h // 7) % 1000) < NEG_RATE * 1000
+    keep = hard | easy_keep
+    w = np.where(hard, 1.0, 1.0 / NEG_RATE).astype(np.float32)
+    return keep, w
+
+
+def tune_thresholds(ev, dec, thr, fb, ex, mg, rounds=2):
+    """Coordinate search of every threshold directly on end-to-end macro F0.5."""
+    grid = np.round(np.arange(0.20, 0.991, 0.02), 3)
+    best = ev(dec(thr, fb, ex, mg))["e2e"]
+    for _ in range(rounds):
+        for key in list(thr):
+            for t in grid:
+                trial = dict(thr)
+                trial[key] = float(t)
+                sc = ev(dec(trial, fb, ex, mg))["e2e"]
+                if sc > best + 1e-6:
+                    best, thr = sc, trial
+    return thr, best
+
+
+def predict_p(bundle, X):
+    """Mean of the fold models, then isotonic calibration."""
+    p = np.mean([m.predict_proba(X)[:, 1] for m in bundle["models"]], axis=0)
+    cal = bundle.get("calibrator")
+    return cal.predict(p) if cal is not None else p
+
+
+NEG_RATE = 0.2         # share of easy negatives kept for training (rest dropped, kept ones reweighted)
+HARD_NEG_SIM = 0.8     # negatives at least this similar (n_best) are always kept
+
+
+def load_gt_counts(procs, id_override=None):
+    """{S1 id: #true matches}, counting only targets present in the processed S2/S3 tables
+    (identical to the raw GT on full data; correct for --limit dev slices)."""
+    gt = pd.read_csv(C.TRAIN_GT, sep="\t", dtype=str, keep_default_na=False, quoting=3)
+    flat = pd.DataFrame({"s1": gt.iloc[:, 0].str.strip(), "t": gt.iloc[:, 1].fillna("").str.split(",")}).explode("t")
+    flat["t"] = flat["t"].fillna("").str.strip()
+    have = pd.Index([])
+    for n in (2, 3):
+        col = detect_id(pq.ParquetFile(procs[n]).schema_arrow.names, id_override)
+        have = have.append(pd.Index(pd.read_parquet(procs[n], columns=[col]).iloc[:, 0].astype(str)))
+    flat["ok"] = flat["t"].isin(have)
+    return flat.groupby("s1")["ok"].sum()
+
+
 def cmd_train(a):
+    from sklearn.isotonic import IsotonicRegression
     t0 = time.time()
     files = cand_files("train")
     c = pd.concat([read_cand_file(f, a.s1_frac) for f in files], ignore_index=True)
@@ -296,57 +476,104 @@ def cmd_train(a):
     print(f"train candidates: {len(c):,}, positives: {y.sum():,} ({y.mean():.3%})")
     procs = find_processed("train", parse_procs(a.proc_file))
     need = set(c["s1_id"]) | set(c["cand_id"])
-    tabs = {s: load_table(procs[s], need, a.id_col) for s in (1, 2, 3)}
+    tabs = load_tables(procs, need, a.id_col)
     X = compute_features(c, tabs, a.workers)
     print(f"features done in {time.time() - t0:.0f}s")
     ok = ~X[FEATS].isna().all(axis=1).values
     c, X, y = c[ok].reset_index(drop=True), X[ok].reset_index(drop=True), y[ok]
 
-    val = (pd.util.hash_array(c["s1_id"].values) % 5 == 0)
-    model, is_lgb = make_model()
-    if is_lgb:
-        import lightgbm as lgb
-        model.fit(X[~val], y[~val], eval_set=[(X[val], y[val])], eval_metric="average_precision",
-                  callbacks=[lgb.early_stopping(50, verbose=False)])
-    else:
-        model.fit(X[~val], y[~val])
-    pv = model.predict_proba(X[val])[:, 1]
-    yv, cv = y[val], c[val].reset_index(drop=True)
-    thr = {s: best_threshold(yv[cv["srcn"].values == s], pv[cv["srcn"].values == s]) for s in (2, 3)}
-    print("thresholds:", thr)
+    # K-fold grouped by S1 entity (all candidates of one S1 stay in one fold) -> out-of-fold preds
+    h = pd.util.hash_array(c["s1_id"].values)
+    fold = (h % a.folds).astype(int)
+    inner_all = (h // a.folds) % 10 == 0          # early-stopping split, independent of the fold id
+    hp = pd.util.hash_array((c["s1_id"] + "|" + c["cand_id"]).values)
+    samp, wts = train_sample(X, y, hp)
+    print(f"training rows after easy-negative sampling: {samp.sum():,} of {len(c):,}")
+    oof = np.zeros(len(c), np.float32)
+    models = []
+    for k in range(a.folds):
+        te = fold == k
+        tr = ~te & samp
+        m = fit_one(X[tr].reset_index(drop=True), y[tr], inner_all[tr], wts[tr])
+        oof[te] = m.predict_proba(X[te])[:, 1]
+        models.append(m)
+        print(f"  fold {k}: train {tr.sum():,} / held-out {te.sum():,}  "
+              f"trees {getattr(m, 'best_iteration_', None)}  ({time.time() - t0:.0f}s)")
+    cal = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(oof, y)
+    pc = cal.predict(oof)
+    from sklearn.metrics import average_precision_score, brier_score_loss
+    print(f"OOF average precision {average_precision_score(y, oof):.4f} | Brier raw {brier_score_loss(y, oof):.4f}"
+          f" -> calibrated {brier_score_loss(y, pc):.4f}")
 
+    # thresholds per (source, address-missing) on calibrated OOF; fall back to per-source if sparse
+    am = (X["a_missing"].fillna(0).values > 0).astype(int)
+    thr = {}
+    for s_ in (2, 3):
+        ms = c["srcn"].values == s_
+        thr[s_] = best_threshold(y[ms], pc[ms])
+        for a_ in (0, 1):
+            mm = ms & (am == a_)
+            if y[mm].sum() >= 200:
+                thr[(s_, a_)] = best_threshold(y[mm], pc[mm])
+    print("thresholds:", {str(k): round(v, 4) for k, v in thr.items()})
+
+    # exact leaderboard metric: GT match counts (blocking misses count) + S1 entities without candidates
+    n_true = load_gt_counts(procs, a.id_col)
+    pop = C.PROCESSED_DIR / "blocked_s1_train.parquet"         # written by blocking.py
+    s1_all = (pd.read_parquet(pop).iloc[:, 0] if pop.exists() else pd.read_parquet(
+        procs[1], columns=[detect_id(pq.ParquetFile(procs[1]).schema_arrow.names, a.id_col)]).iloc[:, 0]).astype(str)
+    if a.s1_frac < 1.0:
+        s1_all = s1_all[pd.util.hash_array(s1_all.values) % 10_000 < int(a.s1_frac * 10_000)]
+    s1_all = s1_all[s1_all.isin(n_true.index)]
+    absent = s1_all[~s1_all.isin(set(c["s1_id"]))]
+    n_abs_single = int((absent.map(n_true) == 0).sum())
+    ev = MacroF05(c["s1_id"].values, y, n_true.to_dict(), n_abs_single, len(absent) - n_abs_single)
+    print(f"S1 population {len(s1_all):,}: {len(absent):,} without candidates "
+          f"({n_abs_single:,} singletons score 1, the rest 0)")
+
+    dec = Decider(c.assign(a_missing=X["a_missing"].values), pc).compress(0.2 * 0.5)   # min grid thr x low_frac
+    print(f"decision search over {len(dec.p):,} rows with p >= 0.1 (of {len(pc):,})")
     best = None
-    print(f"{'fallback':>9} {'exclusive':>10} {'P':>7} {'R':>7} {'F1':>7}   (within candidate set)")
+    print(f"{'fallback':>9} {'exclusive':>10} {'margin':>7} {'P':>7} {'R':>7} {'F0.5':>7} {'macro(cands)':>12} "
+          f"{'macro(e2e)':>10}   (OOF; R counts all GT matches)")
     for fb in (False, True):
         for ex in (False, True):
-            p, r, f = prf(yv, decide(cv, pv, thr, fb, ex))
-            print(f"{str(fb):>9} {str(ex):>10} {p:7.4f} {r:7.4f} {f:7.4f}")
-            if best is None or f > best[0]:
-                best = (f, fb, ex)
-    print(f"best rule: fallback={best[1]} exclusive={best[2]} F1={best[0]:.4f}")
-    print("NOTE: recall here is over blocking candidates only; multiply by the blocking pair recall for end-to-end.")
+            for mg in (0.0, 0.05, 0.1, 0.2):
+                m = ev(dec(thr, fb, ex, mg))
+                print(f"{str(fb):>9} {str(ex):>10} {mg:7.2f} {m['P']:7.4f} {m['R']:7.4f} {m['F0.5']:7.4f} "
+                      f"{m['macro']:12.4f} {m['e2e']:10.4f}")
+                if best is None or m["e2e"] > best[0]:
+                    best = (m["e2e"], fb, ex, mg)
+    print(f"best rule: fallback={best[1]} exclusive={best[2]} margin={best[3]} macroF0.5(e2e)={best[0]:.4f}")
+    thr, sc = tune_thresholds(ev, dec, thr, best[1], best[2], best[3])
+    print(f"decision search done ({time.time() - t0:.0f}s)")
+    print("thresholds tuned on macro F0.5:", {str(k): round(v, 3) for k, v in thr.items()},
+          f"-> macroF0.5(e2e)={sc:.4f}  <- expected leaderboard score (OOF estimate)")
+    best = (sc,) + best[1:]
 
-    imp = getattr(model, "feature_importances_", None)
+    imp = getattr(models[0], "feature_importances_", None)
     if imp is not None:
-        top = sorted(zip(X.columns, imp), key=lambda z: -z[1])[:12]
+        top = sorted(zip(X.columns, imp), key=lambda z: -z[1])[:15]
         print("top features:", ", ".join(f"{k}({v})" for k, v in top))
     os.makedirs(os.path.join(ROOT, "models"), exist_ok=True)
     out = os.path.join(ROOT, "models", "stage4_model.joblib")
-    joblib.dump({"model": model, "feats": list(X.columns), "thr": thr,
-                 "fallback": best[1], "exclusive": best[2]}, out)
+    joblib.dump({"models": models, "calibrator": cal, "feats": list(X.columns), "thr": thr,
+                 "fallback": best[1], "exclusive": best[2], "margin": best[3]}, out)
     print("saved", out)
 
 
 def cmd_predict(a):
     bundle = joblib.load(os.path.join(ROOT, "models", "stage4_model.joblib"))
-    model, cols, thr = bundle["model"], bundle["feats"], bundle["thr"]
+    if "models" not in bundle:                         # older single-model bundle
+        bundle = dict(bundle, models=[bundle["model"]], calibrator=None, margin=0.0)
+    cols, thr = bundle["feats"], bundle["thr"]
     files = cand_files("test")
     procs = find_processed("test", parse_procs(a.proc_file))
     need = set()
     for f in files:
         d = pd.read_parquet(f, columns=["s1_id", "cand_id"])
         need |= set(d["s1_id"].astype(str)) | set(d["cand_id"].astype(str))
-    tabs = {s: load_table(procs[s], need, a.id_col) for s in (1, 2, 3)}
+    tabs = load_tables(procs, need, a.id_col)
     floor = min(thr.values()) * 0.5
     kept = []
     for i, f in enumerate(files):
@@ -355,24 +582,24 @@ def cmd_predict(a):
         for col in cols:
             if col not in X.columns:
                 X[col] = np.nan
-        p = model.predict_proba(X[cols])[:, 1]
+        p = predict_p(bundle, X[cols])
         m = p >= floor
         kept.append(pd.DataFrame({"s1_id": c["s1_id"].values[m], "cand_id": c["cand_id"].values[m],
-                                  "srcn": c["srcn"].values[m], "p": p[m]}))
+                                  "srcn": c["srcn"].values[m], "a_missing": X["a_missing"].values[m], "p": p[m]}))
         print(f"[{i + 1}/{len(files)}] {os.path.basename(f)}: {len(c):,} pairs, {m.sum():,} above floor")
     allp = pd.concat(kept, ignore_index=True)
-    keep = decide(allp, allp["p"].values, thr, bundle["fallback"], bundle["exclusive"])
+    keep = decide(allp, allp["p"].values, thr, bundle["fallback"], bundle["exclusive"], bundle.get("margin", 0.0))
     res = allp[keep]
     os.makedirs(os.path.join(ROOT, "output"), exist_ok=True)
     out = os.path.join(ROOT, "output", "matching_results.tsv")
-    if a.format == "grouped":
-        g = res.groupby("s1_id")["cand_id"].apply(lambda s: ",".join(sorted(s.unique()))).reset_index()
-        g.columns = ["source1_entity_id", "matched_entity_ids"]
-        g.to_csv(out, sep="\t", index=False)
-    else:
-        res[["s1_id", "cand_id"]].rename(columns={"s1_id": "source1_entity_id", "cand_id": "matched_entity_id"}) \
-            .to_csv(out, sep="\t", index=False)
-    res.to_parquet(os.path.join(ROOT, "dataset", "processed", "matches_test_scored.parquet"), index=False)
+    # validator needs one row per test S1 entity (empty string = no match)
+    s1_ids = pd.read_csv(os.path.join(ROOT, "dataset", "test", "test_source1.tsv"), sep="\t", dtype=str,
+                         usecols=[0], keep_default_na=False, quoting=3).iloc[:, 0].str.strip()
+    g = res.groupby("s1_id")["cand_id"].apply(lambda s: ",".join(sorted(s.unique())))
+    g = g.reindex(pd.unique(s1_ids)).fillna("").reset_index()
+    g.columns = ["source1_entity_id", "matched_entity_ids"]
+    g.to_csv(out, sep="\t", index=False)
+    res.to_parquet(C.PROCESSED_DIR / "matches_test_scored.parquet", index=False)
     print(f"wrote {out}: {res['s1_id'].nunique():,} S1 entities matched, {len(res):,} pairs")
 
 
@@ -395,8 +622,9 @@ def main():
         p.add_argument("--id-col", default=None, help="entity ID column name in processed parquet")
         if name == "train":
             p.add_argument("--s1-frac", type=float, default=1.0, help="hash-sample of S1 entities to train on")
+            p.add_argument("--folds", type=int, default=5, help="grouped CV folds (by S1 entity)")
         else:
-            p.add_argument("--format", choices=["grouped", "long"], default="grouped")
+            p.add_argument("--format", choices=["grouped"], default="grouped")  # only format the validator accepts
     a = ap.parse_args()
     a.fn(a)
 
