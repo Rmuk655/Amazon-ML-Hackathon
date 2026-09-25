@@ -29,7 +29,7 @@ BLOCK_FEATS = ["src", "score", "mask", "rank", "tf_cos", "tf_rank", "fwd_n", "fw
                "rev_n", "rev_margin"]
 CHEAP_FEATS = ["c_name", "c_addr", "c_house"]
 MODEL = os.path.join(C.RUN_MODELS_DIR, "pruner.joblib")
-FIT_MAX_PAIRS = 6_000_000      # training sample (hash-sampled by S1 entity)
+FIT_MAX_PAIRS = int(os.environ.get("BER_PRUNE_FIT_PAIRS", "6000000"))   # training sample (hash-sampled by S1 entity)
 
 
 def parts(split):

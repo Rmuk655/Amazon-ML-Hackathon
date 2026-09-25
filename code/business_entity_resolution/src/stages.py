@@ -23,7 +23,7 @@ RAW = [str(C.source_path(sp, n)) for sp in ("train", "test") for n in (1, 2, 3)]
 PROC = lambda sp: [str(C.processed_path(sp, n)) for n in (1, 2, 3)]
 CAND = lambda sp: [os.path.join(D, f"candidates_{sp}", "*.parquet")]
 MODELS = str(C.RUN_MODELS_DIR)
-ENV = ["BER_EXTRA_FEATS", "BER_LR", "S1_FRAC", "FOLDS", "BER_K", "BER_K_REV", "BER_ONLY_COUNTRY", "BER_PROCESSED_DIR",
+ENV = ["BER_EXTRA_FEATS", "BER_LR", "S1_FRAC", "FOLDS", "BER_K", "BER_K_REV", "BER_PRUNE_FIT_PAIRS", "BER_ONLY_COUNTRY", "BER_PROCESSED_DIR",
        "BER_MODELS_DIR"]
 TEXT = ["text_utils.py", "canonical.py", "config.py"]
 
