@@ -12,6 +12,10 @@ DATASET_DIR = STUDENT_RESOURCE / "dataset"
 PROCESSED_DIR = Path(os.environ.get("BER_PROCESSED_DIR", DATASET_DIR / "processed"))
 OUTPUT_DIR = STUDENT_RESOURCE / "output"       # final submission files
 MODELS_DIR = CODE_DIR / "models"
+# trained pipeline models (pruner, matcher); BER_MODELS_DIR lets dev experiments write elsewhere
+RUN_MODELS_DIR = Path(os.environ.get("BER_MODELS_DIR", STUDENT_RESOURCE / "models"))
+# matcher learning rate: 0.05 hit the 1500-tree cap in every fold; 0.1 early-stops ~2-3x sooner
+LGB_LEARNING_RATE = float(os.environ.get("BER_LR", "0.1"))
 INDICLID_FTN_DIR = MODELS_DIR / "indiclid-ftn"  # unzip IndicLID FTN model here (any *.bin)
 PENDING_VOCAB = PROCESSED_DIR / "pending_vocab.tsv"   # (lang, token) pairs still to transliterate
 NAME_VOCAB = PROCESSED_DIR / "name_vocab.tsv"          # clean S1 name tokens for OCR repair (learn_suffixes.py)
@@ -53,7 +57,10 @@ TFIDF_K = 5                # extra candidates per S1 per source by cosine (0 dis
 TFIDF_NGRAM = (3, 4)       # char_wb n-gram range
 TFIDF_MAX_DF = 5000        # drop n-grams in more targets than this (bounds sparse-product cost)
 TFIDF_BLOCK = 2000         # S1 rows per sparse matmul
-K_PER_SOURCE = 50          # candidates kept per S1 entity, separately for S2 and S3
+K_PER_SOURCE = int(os.environ.get("BER_K", "50"))   # candidates kept per S1 entity, separately for S2 and S3
+# target-centric (reverse) candidates: every target also keeps its top K_REV S1 entities by key score, so a
+# record that is outside its true S1's top-K is still compared with that S1 (not only with a lookalike)
+K_REV = int(os.environ.get("BER_K_REV", "3"))
 S1_CHUNK = 100_000         # S1 rows joined at a time (bounds memory)
 KEYGEN_BLOCK = 500_000     # records turned into hashed keys at a time
 WITHIN_COUNTRY = True      # block inside country_norm (set False if EDA shows cross-country matches)

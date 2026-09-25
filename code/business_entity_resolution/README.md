@@ -46,8 +46,25 @@ python matching.py retune --fp-weight 1.0 [--save]   # re-tune thresholds/rules 
 python matching.py decide [--thr-scale 0.95]        # rewrite output/matching_results.tsv from saved test scores
 ```
 
+### Faster iteration
+- **Stage skipping:** `run_pipeline.sh` skips a step whose code, settings, command and inputs are unchanged since its
+  last success (`src/stages.py`, stamps in `dataset/processed/.stamps/`). `FORCE=1` reruns everything.
+- **Feature store:** matching features are cached per candidate file in `dataset/processed/features_<split>/`, in
+  groups (`base`, `amb`, `extra`). A group is recomputed only when its code version (`FEATURE_GROUPS` in
+  `matching.py`) or its inputs change; a new group is computed alone and appended. `BER_FEATURE_CACHE=0` disables it.
+- **Labelled dev loop on the laptop** (~20 min, real data and models untouched):
+  ```bash
+  ./dev_slice.sh                 # India, 5 states: score the saved model on held-out S1s
+  TRAIN=1 ./dev_slice.sh         # retrain on the other half first (3 folds)
+  SLICE=us NAME=exp1 ./dev_slice.sh
+  ```
+- **Laptop + AWS:** `./remote.sh start | push | run "<steps>" | status | pull <paths> | stop` runs memory-heavy steps
+  on the EC2 instance and moves results through S3.
+
 Environment variables: `MEM_CAP` (default `11G`, memory cap via systemd; `none` disables it, e.g. on SageMaker),
-`PY` (python executable), `S1_FRAC`.
+`PY` (python executable), `S1_FRAC`, `FORCE`, `BER_LR` (matcher learning rate, default 0.1), `BER_MODELS_DIR`
+(where pruner/matcher models are read and written), `BER_PROCESSED_DIR`, `BER_EXTRA_FEATS` (0 disables the extra
+similarity features), `BER_FEATURE_CACHE`, `BER_ONLY_COUNTRY` (preprocess one country; dev runs).
 
 ### Transliteration (IndicXlit)
 Only ~1.5k distinct Indic tokens exist, so transliteration is done once at vocabulary level:
