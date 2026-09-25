@@ -32,6 +32,53 @@ def _fallback(text: str) -> str:
     return _NON_ALNUM.sub("", unidecode(text).lower()) or text
 
 
+# Indic abbreviations of "Pvt. Ltd." ('प्रा. लि.', 'પ્રા. લિ.'): IndicXlit spells them out phonetically.
+ABBR_ROMAN = {"praa": "pvt", "ly": "ltd", "lii": "ltd"}
+_VOWELS = re.compile(r"[aeiouy]")
+
+
+def _skeleton(t):
+    r = t[0] + _VOWELS.sub("", t[1:].replace("h", ""))
+    return re.sub(r"(.)\1+", r"\1", r)
+
+
+def snap_to_vocab(cache, vocab_path, min_count=300, min_ratio=80):
+    """IndicXlit spells English loanwords phonetically ('limitted', 'praivat', 'entreprises',
+    'gujaraat'), so they miss the Latin spelling Source 1 uses (and legal forms are not stripped).
+    Replace an output by a common S1 name word when (a) the output itself is rare in S1 names,
+    (b) the two are close (Indel ratio >= min_ratio) and (c) they sound alike: same consonant
+    skeleton, or ratio >= 90 for long words. Vocabulary = clean S1 name tokens (no labels)."""
+    from rapidfuzz import fuzz, process
+    vocab = {}
+    with open(vocab_path, encoding="utf-8") as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) == 2 and p[1].isdigit():
+                vocab[p[0]] = int(p[1])
+    common = [w for w, n in vocab.items() if n >= min_count and w.isalpha() and len(w) >= 3]
+    snapped = {}
+    for key, r in cache.items():
+        if r in ABBR_ROMAN and len(key[1]) <= 4:           # 2-4 code points incl. virama/matra
+            cache[key] = ABBR_ROMAN[r]
+            continue
+        if r in snapped:
+            cache[key] = snapped[r] or r
+            continue
+        best = None
+        if len(r) >= 4 and r.isalpha() and vocab.get(r, 0) < min_count:
+            own, sk = vocab.get(r, 0), _skeleton(r)
+            ok = [(w, sc) for w, sc, _ in process.extract(r, common, scorer=fuzz.ratio, score_cutoff=min_ratio, limit=10)
+                  if own * 50 < vocab[w] and (_skeleton(w) == sk or (sc >= 90 and len(r) >= 7))]
+            if ok:
+                best = max(ok, key=lambda t: (_skeleton(t[0]) == sk, t[1], vocab[t[0]]))[0]
+        snapped[r] = best
+        if best:
+            cache[key] = best
+    n = sum(1 for v in snapped.values() if v)
+    print(f"[translit] snapped {n:,} IndicXlit spellings to S1 vocabulary words")
+    return {r: w for r, w in snapped.items() if w}
+
+
 class Transliterator:
     def __init__(self, backend="unidecode", beam_width=C.BEAM_WIDTH, cache_only=False):
         if backend not in ("unidecode", "indicxlit"):
@@ -66,6 +113,8 @@ class Transliterator:
                 if len(parts) == 3:
                     self.cache[(parts[0], parts[1])] = parts[2]
         print(f"[translit] cache: {len(self.cache):,} entries from {self.cache_path.name}")
+        if self.backend == "indicxlit" and Path(C.NAME_VOCAB).exists():
+            snap_to_vocab(self.cache, C.NAME_VOCAB)
 
     def _one(self, lang, text):
         """-> (romanized, cacheable). Engine failures are not cached, so they retry later."""
@@ -139,4 +188,4 @@ if __name__ == "__main__":
     ap.add_argument("--backend", default="indicxlit", choices=["indicxlit", "unidecode"])
     ap.add_argument("--beam-width", type=int, default=C.BEAM_WIDTH)
     a = ap.parse_args()
-    Transliterator(a.backend, a.beam_width).romanize(read_pending(a.fill))
+    Transliterator(a.backend, a.beam_width).romanize(read_pending(a.fill))
