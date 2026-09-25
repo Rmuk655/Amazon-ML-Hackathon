@@ -1,12 +1,17 @@
-# Freeze exact versions with `pip freeze` once your environment works (required for submission).
-pandas
-pyarrow
-numpy<2            # fasttext-wheel breaks on numpy 2.x
-tqdm
-unidecode
-rapidfuzz          # Jaro-Winkler etc. (EDA, later pair features)
-fasttext-wheel     # IndicLID native-script model (FTN)
+# Pinned from the working environment (Python 3.12.3). Install: pip install -r requirements.txt
+pandas==3.0.6
+pyarrow==25.0.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+joblib==1.6.0
+tqdm==4.70.1
+Unidecode==1.4.0
+RapidFuzz==3.14.6
+sparse_dot_topn==1.2.0   # fast TF-IDF top-k in blocking (falls back to scipy if missing)
 
-# Only for --backend indicxlit (heavy; on Windows use WSL2 / Colab / Kaggle):
-# torch
-# ai4bharat-transliteration
+# Optional - IndicLID language ID (only used if a model is placed in models/indiclid-ftn; needs numpy<2):
+# fasttext-wheel
+# Optional - IndicXlit transliteration; run separately via colab/translit_colab.ipynb (Python 3.9):
+# torch==1.13.1  ai4bharat-transliteration
