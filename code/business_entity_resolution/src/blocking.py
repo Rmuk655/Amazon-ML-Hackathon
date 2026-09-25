@@ -303,6 +303,9 @@ def run(args):
     S1 = load(args.split, 1)
     if args.limit_s1:
         S1 = S1.head(args.limit_s1)
+    if args.s1_address_tokens:     # dev: only S1 whose address contains one of these tokens (e.g. states)
+        want = set(args.s1_address_tokens)
+        S1 = S1[S1["business_address_rom"].fillna("").map(lambda a: not want.isdisjoint(a.split()))]
     T = pd.concat([load(args.split, 2).assign(src=2), load(args.split, 3).assign(src=3)], ignore_index=True)
     for df in (S1, T):
         df["business_name_c4b"] = df["business_name_c4b"].fillna("")
@@ -474,6 +477,7 @@ def main():
     ap.add_argument("--countries", nargs="*", help="only these country_norm values (memory control)")
     ap.add_argument("--cross-country", action="store_true")
     ap.add_argument("--limit-s1", type=int, default=None, help="dev: first N S1 rows")
+    ap.add_argument("--s1-address-tokens", nargs="*", help="dev: keep S1 whose address has one of these tokens")
     ap.add_argument("--write-tsv", action="store_true")
     run(ap.parse_args())
 
