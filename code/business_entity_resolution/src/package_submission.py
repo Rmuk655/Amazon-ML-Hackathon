@@ -21,6 +21,7 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 CODE = os.path.join(ROOT, "code", "business_entity_resolution")
+SKIP_FILES = {"profile_data.py"}   # analysis-only, not part of the submission
 SKIP_DIRS = {"__pycache__", ".ipynb_checkpoints", ".git", "venv", ".venv", "logs"}
 SKIP_EXT = {".pyc", ".parquet", ".joblib", ".bin", ".zip", ".pkl"}
 MAX_CODE_FILE_MB = 5
@@ -94,7 +95,7 @@ def collect_code_files():
         dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
         for f in fs:
             p = os.path.join(d, f)
-            if os.path.splitext(f)[1].lower() in SKIP_EXT:
+            if f in SKIP_FILES or os.path.splitext(f)[1].lower() in SKIP_EXT:
                 continue
             if os.path.getsize(p) > MAX_CODE_FILE_MB * 1e6:
                 warn(f"skipping large file {os.path.relpath(p, ROOT)}")

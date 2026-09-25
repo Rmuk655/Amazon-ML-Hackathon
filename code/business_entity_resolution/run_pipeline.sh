@@ -14,16 +14,18 @@ declare -A CMD=(
   [sanity]="sanity_check.py"
   [block_dev]="blocking.py --split train --eval --limit-s1 50000"
   [block_train]="blocking.py --split train --eval"
+  [prune_train]="prune.py fit"
+  [prune_test]="prune.py apply --split test"
   [match_dev]="matching.py train --s1-frac 0.05"
   [match_train]="matching.py train --s1-frac ${S1_FRAC:-0.3}"
-  [block_test]="blocking.py --split test --write-tsv"
+  [block_test]="blocking.py --split test"
   [predict]="matching.py predict"
   [rob_slices]="robutness.py slices"
   [rob_holdout]="robutness.py holdout"
   [rob_testshift]="robutness.py testshift"
   [package]="package_submission.py"
 )
-ORDER=(learn preprocess sanity block_dev block_train match_dev match_train block_test predict
+ORDER=(learn preprocess sanity block_dev block_train prune_train match_dev match_train block_test prune_test predict
        rob_slices rob_holdout rob_testshift package)
 STEPS=("${@:-${ORDER[@]}}")
 
