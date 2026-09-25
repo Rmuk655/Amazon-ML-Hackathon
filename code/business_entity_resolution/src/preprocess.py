@@ -159,20 +159,36 @@ def main():
     ap.add_argument("--dump-vocab", action="store_true", help="only write pending_vocab.tsv (no transliteration)")
     ap.add_argument("--cache-only", action="store_true", help="never call IndicXlit; unknown tokens use unidecode")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--jobs", type=int, default=3, help="files processed in parallel (~10 GB RAM each)")
     a = ap.parse_args()
 
     C.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    global OCR
-    OCR = load_ocr_fixer()
-    lid = NativeLID()
-    xlit = Transliterator(a.backend, a.beam_width, a.cache_only)
+    todo = []
     for split in a.splits:
         for n in a.sources:
             dst = C.processed_path(split, n)
             if dst.exists() and not a.overwrite and not a.dump_vocab:
                 print(f"[skip] {dst.name} exists (use --overwrite)")
                 continue
-            process_file(C.source_path(split, n), dst, lid, xlit, a.limit, a.dump_vocab)
+            todo.append((split, n))
+    # files are independent -> run them in parallel (each ~10 GB peak); vocab dumping and
+    # engine transliteration write shared files, so those stay sequential
+    jobs = 1 if (a.dump_vocab or not a.cache_only and a.backend == "indicxlit") else max(1, a.jobs)
+    if jobs > 1 and len(todo) > 1:
+        from multiprocessing import get_context
+        with get_context("spawn").Pool(min(jobs, len(todo))) as pool:
+            pool.starmap(_run_one, [(sp, n, a) for sp, n in todo])
+    else:
+        for sp, n in todo:
+            _run_one(sp, n, a)
+
+
+def _run_one(split, n, a):
+    global OCR
+    if OCR is None:
+        OCR = load_ocr_fixer()
+    process_file(C.source_path(split, n), C.processed_path(split, n), NativeLID(),
+                 Transliterator(a.backend, a.beam_width, a.cache_only), a.limit, a.dump_vocab)
 
 
 if __name__ == "__main__":

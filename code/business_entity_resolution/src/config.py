@@ -49,11 +49,11 @@ KTYPES = ("core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join"
 BLOCK_CAPS = {"core": 300, "tok": 100, "skelbi": 100, "pre": 100, "addrpc": 100,
               "nameaddr": 100, "addrbi": 50, "join": 100, "tfidf": 0}   # tfidf: not a key (mask bit only)
 # char n-gram TF-IDF channel on core names (second, similarity-based blocking channel)
-TFIDF_K = 3                # extra candidates per S1 per source by cosine (0 disables the channel)
+TFIDF_K = 5                # extra candidates per S1 per source by cosine (0 disables the channel)
 TFIDF_NGRAM = (3, 4)       # char_wb n-gram range
 TFIDF_MAX_DF = 5000        # drop n-grams in more targets than this (bounds sparse-product cost)
 TFIDF_BLOCK = 2000         # S1 rows per sparse matmul
-K_PER_SOURCE = 30          # candidates kept per S1 entity, separately for S2 and S3
+K_PER_SOURCE = 50          # candidates kept per S1 entity, separately for S2 and S3
 S1_CHUNK = 100_000         # S1 rows joined at a time (bounds memory)
 KEYGEN_BLOCK = 500_000     # records turned into hashed keys at a time
 WITHIN_COUNTRY = True      # block inside country_norm (set False if EDA shows cross-country matches)

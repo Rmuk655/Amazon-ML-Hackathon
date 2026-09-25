@@ -37,6 +37,15 @@ pip install -r requirements.txt
 | `rob_*` | `robutness.py slices / holdout / testshift` | |
 | `package` | `package_submission.py` | runs `utils/validate_submission.py`; refuses to zip on failure |
 
+### Cheap iteration (no retraining)
+`match_train` saves out-of-fold predictions and `predict` saves every test pair scored >= 0.05, so decision
+experiments take minutes instead of a full run:
+```bash
+cd src
+python matching.py retune --fp-weight 1.0 [--save]   # re-tune thresholds/rules on out-of-fold predictions
+python matching.py decide [--thr-scale 0.95]        # rewrite output/matching_results.tsv from saved test scores
+```
+
 Environment variables: `MEM_CAP` (default `11G`, memory cap via systemd; `none` disables it, e.g. on SageMaker),
 `PY` (python executable), `S1_FRAC`.
 
