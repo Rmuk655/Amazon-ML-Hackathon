@@ -30,19 +30,22 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from rapidfuzz import fuzz
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import OSA, JaroWinkler, LCSseq, Levenshtein
+from rapidfuzz.process import cpdist
+from scipy import sparse
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 import config as C
-from text_utils import ADDRESS_ABBR
+from text_utils import ADDRESS_ABBR, normalize_address
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))  # .../student_resource
 # Short internal feature-column names -> actual column names written by preprocess.py.
-TEXT_COLS = ["name_norm", "name_rom", "addr_norm", "addr_rom", "country_norm", "core"]
+TEXT_COLS = ["name_norm", "name_rom", "addr_norm", "addr_rom", "country_norm", "core", "addr_raw"]
 COL_MAP = {
     "name_norm": "business_name_norm", "name_rom": "business_name_rom",
     "addr_norm": "business_address_norm", "addr_rom": "business_address_rom",
-    "country_norm": "country_norm", "core": "business_name_c4b",
+    "country_norm": "country_norm", "core": "business_name_c4b", "addr_raw": "business_address",
 }
 ID_CANDIDATES = ["entity_id", "id", "source_entity_id", "record_id", "uid"]
 RESERVED = {"s1_id", "cand_id", "src", "is_true"}
@@ -229,6 +232,161 @@ def cand_files(split):
     return files
 
 
+# --------------------------------------------------------------------------- extra similarity features
+# Levenshtein / Damerau (OSA) / LCS edit similarities, character-trigram Jaccard, TF-IDF cosine
+# (character and word) and IDF-weighted token Jaccard for names and addresses, plus address
+# comparisons on a country-aware canonical form. TF-IDF weights are fitted per country without
+# labels: token rarity differs by country ('road' is common in India, 'rue' in France, 'street' in
+# the US). BER_EXTRA_FEATS=0 switches the block off (A/B runs).
+EXTRA = os.environ.get("BER_EXTRA_FEATS", "1") != "0"
+EXTRA_FEATS = [
+    "n_lev_rom", "n_lcs_rom", "n_osa_core", "n_jw_core", "n_tset_core",
+    "n_char3_jacc", "n_tfidf_char", "n_tfidf_word", "n_idf_jacc",
+    "a_lev_canon", "a_tset_canon", "a_char3_jacc", "a_tfidf_char", "a_tfidf_word", "a_idf_jacc",
+    "a_comp_jacc", "a_comp_cov",
+]
+_ORDINALS = {w: f"{i}{'st' if i % 10 == 1 and i != 11 else 'nd' if i % 10 == 2 and i != 12 else 'rd' if i % 10 == 3 and i != 13 else 'th'}"
+             for i, w in enumerate("first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth "
+                                   "thirteenth fourteenth fifteenth sixteenth seventeenth eighteenth nineteenth "
+                                   "twentieth".split(), 1)}
+_DIRECTIONS = {"n": "north", "s": "south", "e": "east", "w": "west",
+               "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest"}
+_US_UNIT = {"suite", "apt", "apartment", "unit", "fl", "floor", "pmb", "room", "rm", "bldg", "building", "lot"}
+_IN_NOISE = {"no", "number", "hno"}           # 'H.No. 12', 'No.4/2', 'Plot No 7'
+_FR_NOISE = {"n", "bis", "ter"}               # 'N° 21 Rue ...', '53 Bis Rue ...'
+
+
+@lru_cache(maxsize=2_000_000)
+def addr_canon(addr, country):
+    """Country-aware canonical address (on the romanised, abbreviation-unified text):
+    US: ordinal words -> '15th', N/S/E/W -> north/..., unit designators (suite 200, fl 3, pmb 51)
+    dropped (Source 1 keeps them, S2 mostly does not); India: ordinals, 'no'/'h no' fillers dropped;
+    France: 'n°', 'bis', 'ter' dropped."""
+    out, t, skip = [], [ADDRESS_ABBR.get(w, w) for w in addr.split()], False
+    for i, w in enumerate(t):
+        if skip:
+            skip = False
+            continue
+        if country == "us":
+            w = _ORDINALS.get(w, w)
+            if w in _US_UNIT and i + 1 < len(t) and (any(ch.isdigit() for ch in t[i + 1]) or len(t[i + 1]) == 1):
+                skip = True
+                continue
+            w = _DIRECTIONS.get(w, w)
+        elif country == "india":
+            w = _ORDINALS.get(w, w)
+            if w in _IN_NOISE or (w == "h" and i + 1 < len(t) and t[i + 1] == "no"):
+                continue
+        elif country == "france" and w in _FR_NOISE:
+            continue
+        out.append(w)
+    return " ".join(out)
+
+
+@lru_cache(maxsize=2_000_000)
+def addr_components(raw, country):
+    """Comma-separated address parts (street line, locality, city, district, state/region), each
+    canonicalised; compared as a set because sources reorder them ('Lille, Hauts-de-France' vs
+    'Hauts-de-France, Lille')."""
+    return frozenset(x for x in (addr_canon(normalize_address(p), country) for p in raw.split(",")) if x)
+
+
+def _rowdot(A, B):
+    return np.asarray(A.multiply(B).sum(axis=1)).ravel()
+
+
+def _safe_div(a, b):
+    return np.divide(a, b, out=np.zeros_like(a, dtype=np.float64), where=b > 0)
+
+
+def _vector_sims(a, b, char, fit_max=3_000_000, chunk=500_000):
+    """TF-IDF cosine and Jaccard for aligned text arrays a[i] vs b[i]. char=True: character trigrams
+    (within words) -> (cosine, plain trigram Jaccard); char=False: words -> (cosine, IDF-weighted
+    Jaccard). IDF is fitted on the distinct texts of this group (one country) - no labels used."""
+    codes, uniq = pd.factorize(np.concatenate([a, b]))
+    n = len(a)
+    if len(uniq) == 0:
+        return np.zeros(n), np.zeros(n)
+    vec = (TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), binary=True, norm=None, dtype=np.float32)
+           if char else TfidfVectorizer(token_pattern=r"\S+", binary=True, norm=None, dtype=np.float32))
+    fit_on = uniq if len(uniq) <= fit_max else uniq[np.random.default_rng(0).choice(len(uniq), fit_max, replace=False)]
+    try:
+        vec.fit(fit_on)
+    except ValueError:                       # all texts empty
+        return np.zeros(n), np.zeros(n)
+    M = sparse.vstack([vec.transform(uniq[i:i + chunk]) for i in range(0, len(uniq), chunk)]).tocsr()
+    B = M.copy()
+    B.data[:] = 1.0
+    sq, s_idf, cnt = _rowdot(M, M), np.asarray(M.sum(axis=1)).ravel(), np.asarray(B.sum(axis=1)).ravel()
+    ca, cb = codes[:n], codes[n:]
+    cos, jac = np.zeros(n), np.zeros(n)
+    for i in range(0, n, chunk):
+        x, y = ca[i:i + chunk], cb[i:i + chunk]
+        dot = _rowdot(M[x], M[y])
+        cos[i:i + chunk] = _safe_div(dot, np.sqrt(sq[x] * sq[y]))
+        if char:
+            inter = _rowdot(B[x], B[y])
+            jac[i:i + chunk] = _safe_div(inter, cnt[x] + cnt[y] - inter)
+        else:
+            inter = _rowdot(M[x], B[y])          # sum of IDF over shared words
+            jac[i:i + chunk] = _safe_div(inter, s_idf[x] + s_idf[y] - inter)
+    return cos, jac
+
+
+def _pair_texts(c, tabs, ia, col):
+    """Aligned S1 / candidate text arrays for one column ('' where an id is missing)."""
+    n = len(c)
+    t1 = tabs[1].cols[col]
+    a = np.where(ia >= 0, t1[np.maximum(ia, 0)] if len(t1) else "", "").astype(object)
+    b = np.full(n, "", dtype=object)
+    for s in (2, 3):
+        m = np.where(c["srcn"].values == s)[0]
+        if len(m) == 0 or not len(tabs[s].index):
+            continue
+        ib = tabs[s].pos(c["cand_id"].values[m])
+        b[m] = np.where(ib >= 0, tabs[s].cols[col][np.maximum(ib, 0)], "")
+    return a, b
+
+
+def _edit_sim(a, b, scorer, workers):
+    v = cpdist(list(a), list(b), scorer=scorer, workers=workers, dtype=np.float32)
+    return np.where((a != "") & (b != ""), v, 0.0)
+
+
+def extra_features(c, tabs, ia, workers):
+    n = len(c)
+    F = pd.DataFrame(0.0, index=range(n), columns=EXTRA_FEATS, dtype=np.float32)
+    w = -1 if workers > 1 else 1
+    ctry, _ = _pair_texts(c, tabs, ia, "country_norm")
+    nr_a, nr_b = _pair_texts(c, tabs, ia, "name_rom")
+    co_a, co_b = _pair_texts(c, tabs, ia, "core")
+    ar_a, ar_b = _pair_texts(c, tabs, ia, "addr_rom")
+    raw_a, raw_b = _pair_texts(c, tabs, ia, "addr_raw")
+    ca_a = np.array([addr_canon(x, k) for x, k in zip(ar_a, ctry)], dtype=object)
+    ca_b = np.array([addr_canon(x, k) for x, k in zip(ar_b, ctry)], dtype=object)
+    F["n_lev_rom"] = _edit_sim(nr_a, nr_b, Levenshtein.normalized_similarity, w)
+    F["n_lcs_rom"] = _edit_sim(nr_a, nr_b, LCSseq.normalized_similarity, w)
+    F["n_osa_core"] = _edit_sim(co_a, co_b, OSA.normalized_similarity, w)
+    F["n_jw_core"] = _edit_sim(co_a, co_b, JaroWinkler.similarity, w)
+    F["n_tset_core"] = _edit_sim(co_a, co_b, fuzz.token_set_ratio, w) / 100
+    F["a_lev_canon"] = _edit_sim(ca_a, ca_b, Levenshtein.normalized_similarity, w)
+    F["a_tset_canon"] = _edit_sim(ca_a, ca_b, fuzz.token_set_ratio, w) / 100
+    for k in pd.unique(ctry):                   # TF-IDF fitted per country
+        g = np.where(ctry == k)[0]
+        for pre, (x, y) in (("n", (nr_a, nr_b)), ("a", (ca_a, ca_b))):
+            F.loc[g, f"{pre}_tfidf_char"], F.loc[g, f"{pre}_char3_jacc"] = _vector_sims(x[g], y[g], char=True)
+            F.loc[g, f"{pre}_tfidf_word"], F.loc[g, f"{pre}_idf_jacc"] = _vector_sims(x[g], y[g], char=False)
+    jac, cov = np.zeros(n, np.float32), np.zeros(n, np.float32)
+    for i, (x, y, k) in enumerate(zip(raw_a, raw_b, ctry)):
+        if x and y:
+            p, q = addr_components(x, k), addr_components(y, k)
+            if p and q:
+                inter = len(p & q)
+                jac[i], cov[i] = inter / len(p | q), inter / len(p)
+    F["a_comp_jacc"], F["a_comp_cov"] = jac, cov
+    return F
+
+
 def compute_features(c, tabs, workers, chunk=100_000):
     n = len(c)
     X = np.full((n, len(FEATS)), np.nan, dtype=np.float32)
@@ -274,6 +432,8 @@ def compute_features(c, tabs, workers, chunk=100_000):
         F["amb_s1_core_freq"] = core_a.map(cc).fillna(0).values.astype(np.float32)
         F["amb_t_core_freq"] = core_b.map(cc).fillna(0).values.astype(np.float32)
         F["amb_core_eq"] = (core_a.values == core_b.values) & (core_a.values != "")
+    if EXTRA:
+        F = pd.concat([F, extra_features(c, tabs, ia, workers)], axis=1)
     for col in c.columns:
         if col not in RESERVED and col != "srcn" and pd.api.types.is_numeric_dtype(c[col]):
             F["blk_" + col] = c[col].values
@@ -714,6 +874,177 @@ def cmd_decide(a):
     write_results(allp, bundle)
 
 
+def cmd_evaluate(a):
+    """Score the saved model on train S1 entities it never saw (hash >= --train-frac, the fraction
+    `train --s1-frac` used) with the exact leaderboard metric - no training. Works on a blocking
+    slice (blocking.py --split train --eval --limit-s1 N): the population is the blocked S1s."""
+    bundle = load_bundle()
+    cols = bundle["feats"]
+    procs = find_processed("train", parse_procs(a.proc_file))
+    cut = int(a.train_frac * 10_000)
+    c = pd.concat([read_cand_file(f) for f in cand_files("train")], ignore_index=True)
+    c = c[pd.util.hash_array(c["s1_id"].values) % 10_000 >= cut].reset_index(drop=True)
+    tabs = load_tables(procs, set(c["s1_id"]) | set(c["cand_id"]), a.id_col)
+    X = compute_features(c, tabs, a.workers)
+    for col in cols:
+        if col not in X.columns:
+            X[col] = np.nan
+    p = predict_p(bundle, X[cols])
+    keep = decide(c.assign(a_missing=X["a_missing"].values), p, bundle["thr"], bundle["fallback"],
+                  bundle["exclusive"], bundle.get("margin", 0.0))
+    y = c["is_true"].astype(bool).values
+    n_true = load_gt_counts(procs, a.id_col)
+    s1_all = pd.read_parquet(C.PROCESSED_DIR / "blocked_s1_train.parquet").iloc[:, 0].astype(str)
+    s1_all = s1_all[(pd.util.hash_array(s1_all.values) % 10_000 >= cut) & s1_all.isin(n_true.index)]
+    ctry = pd.Series(tabs[1].cols["country_norm"], index=tabs[1].index)
+    s1_ctry = pd.read_parquet(procs[1], columns=["entity_id", "country_norm"]).set_index("entity_id")["country_norm"]
+    print(f"held-out S1 entities: {len(s1_all):,} | candidate pairs {len(c):,} ({len(c) / max(len(s1_all), 1):.1f} per S1)")
+    print(f"{'slice':10}{'S1':>10}{'P':>8}{'R':>8}{'F0.5':>8}{'macro F0.5':>12}")
+    for name, s1s in [("all", s1_all)] + [(k, s1_all[s1_all.map(s1_ctry) == k]) for k in sorted(ctry.unique())]:
+        m = c["s1_id"].isin(set(s1s)).values
+        absent = s1s[~s1s.isin(set(c["s1_id"][m]))]
+        n_single = int((absent.map(n_true) == 0).sum())
+        r = MacroF05(c["s1_id"].values[m], y[m], n_true.to_dict(), n_single, len(absent) - n_single)(keep[m])
+        print(f"{name:10}{len(s1s):>10,}{r['P']:8.4f}{r['R']:8.4f}{r['F0.5']:8.4f}{r['e2e']:12.4f}")
+    breakdown_report(a, c, X, p, keep, y, s1_all, procs, tabs)
+    if a.permute:
+        permutation_report(bundle, c, X[cols], y, s1_all, n_true)
+
+
+def breakdown_report(a, c, X, p, keep, y, s1_all, procs, tabs):
+    """Pair-level confusion matrix per target source x address present/missing, where every
+    ground-truth pair of the held-out S1 population ends in exactly one bucket: missed by blocking,
+    removed by pruning, rejected by the model (p below threshold / rules) or matched (TP).
+    Raw counts + % of the slice's true pairs, P/R/F0.5, and mean probability per outcome.
+    Saves every scored pair (eval_pairs.parquet) and the table (eval_breakdown.csv)."""
+    gt = pd.read_csv(C.TRAIN_GT, sep="\t", dtype=str, keep_default_na=False, quoting=3)
+    g = pd.DataFrame({"s1_id": gt.iloc[:, 0].str.strip(), "cand_id": gt.iloc[:, 1].str.split(",")}).explode("cand_id")
+    g["cand_id"] = g["cand_id"].fillna("").str.strip()
+    g = g[(g["cand_id"] != "") & g["s1_id"].isin(set(s1_all))].drop_duplicates().reset_index(drop=True)
+    g["srcn"] = src_num(g["cand_id"].values)
+    tg = load_tables(procs, set(g["s1_id"]) | set(g["cand_id"]), a.id_col)
+    ia = tg[1].pos(g["s1_id"].values)
+    have = np.zeros(len(g), bool)
+    for s_ in (2, 3):
+        m = np.where(g["srcn"].values == s_)[0]
+        have[m] = tg[s_].pos(g["cand_id"].values[m]) >= 0
+    g = g[have & (ia >= 0)].reset_index(drop=True)
+    ia = tg[1].pos(g["s1_id"].values)
+    miss = np.zeros(len(g), bool)
+    for side in (0, 1):
+        present = np.zeros(len(g), bool)
+        for col in ("addr_norm", "addr_rom"):
+            t = _pair_texts(g, tg, ia, col)[side]
+            present |= t != ""
+        miss |= ~present
+    g["a_missing"] = miss.astype(int)
+    key = lambda d: d["s1_id"].astype(str) + "|" + d["cand_id"].astype(str)
+    blocked = set()
+    if a.blocked_dir:
+        for f in sorted(glob.glob(os.path.join(a.blocked_dir, "*.parquet"))):
+            b = pd.read_parquet(f, columns=["s1_id", "cand_id", "is_true"])
+            b = b[b["is_true"].astype(bool)]
+            blocked |= set(key(b))
+    c = c.assign(a_missing=(X["a_missing"].fillna(0).values > 0).astype(int), p=p, keep=keep, is_true=y)
+    feats = X.drop(columns=[f for f in ("a_missing", "srcn") if f in X.columns]).reset_index(drop=True)
+    pd.concat([c.assign(country=pd.Series(tabs[1].cols["country_norm"], index=tabs[1].index).reindex(c["s1_id"]).values)[
+        ["s1_id", "cand_id", "srcn", "a_missing", "country", "p", "keep", "is_true"]].reset_index(drop=True), feats],
+        axis=1).to_parquet(C.PROCESSED_DIR / "eval_pairs.parquet", index=False)
+    ck = key(c)
+    in_c = set(ck[c["is_true"].values])
+    tp_set = set(ck[c["is_true"].values & c["keep"].values])
+    gk = key(g)
+    g["outcome"] = np.where(gk.isin(tp_set), "TP", np.where(gk.isin(in_c), "rejected_by_model",
+                            np.where(gk.isin(blocked), "removed_by_pruning", "missed_by_blocking")))
+    if not a.blocked_dir:
+        g.loc[g["outcome"] == "removed_by_pruning", "outcome"] = "missed_by_blocking"
+    g.to_parquet(C.PROCESSED_DIR / "eval_gt_outcomes.parquet", index=False)
+    thr = load_bundle()["thr"]
+    rows = []
+    for s_ in (2, 3, None):
+        for am in (0, 1, None):
+            gm = np.ones(len(g), bool) if s_ is None else g["srcn"].values == s_
+            cm = np.ones(len(c), bool) if s_ is None else c["srcn"].values == s_
+            if am is not None:
+                gm &= g["a_missing"].values == am
+                cm &= c["a_missing"].values == am
+            d, o = c[cm], g[gm]["outcome"].value_counts()
+            n_gt = int(gm.sum())
+            tp = int(o.get("TP", 0))
+            fp = int((d["keep"] & ~d["is_true"]).sum())
+            tn = int((~d["keep"] & ~d["is_true"]).sum())
+            P, R = tp / max(tp + fp, 1), tp / max(n_gt, 1)
+            mp = lambda m: float(d["p"][m].mean()) if m.any() else float("nan")
+            rows.append({
+                "source": "all" if s_ is None else f"S{s_}",
+                "address": "all" if am is None else ("missing" if am else "present"),
+                "threshold": "" if s_ is None or am is None else round(thr_of(thr, s_, am), 3),
+                "true_pairs": n_gt,
+                "missed_by_blocking": int(o.get("missed_by_blocking", 0)),
+                "removed_by_pruning": int(o.get("removed_by_pruning", 0)),
+                "rejected_by_model": int(o.get("rejected_by_model", 0)),
+                "TP": tp, "FP": fp, "FN": n_gt - tp, "TN_candidates": tn,
+                "P": P, "R": R, "F05": float(fbeta(P, R)),
+                "p_TP": mp(d["keep"] & d["is_true"]), "p_FP": mp(d["keep"] & ~d["is_true"]),
+                "p_rejected_true": mp(~d["keep"] & d["is_true"]), "p_TN": mp(~d["keep"] & ~d["is_true"]),
+            })
+    t = pd.DataFrame(rows)
+    t.to_csv(C.PROCESSED_DIR / "eval_breakdown.csv", index=False)
+    pct = lambda n, tot: f"{n:>10,} {100 * n / max(tot, 1):5.1f}%"
+    print("\nconfusion matrix by target source x address (pairs; % of the slice's true pairs)")
+    for r in t.itertuples():
+        print(f"\n[{r.source} | address {r.address}] threshold {r.threshold or '-'} | true pairs {r.true_pairs:,}")
+        print(f"   TP (matched)             {pct(r.TP, r.true_pairs)}   mean p {r.p_TP:.3f}")
+        print(f"   FN total                 {pct(r.FN, r.true_pairs)}")
+        print(f"     missed by blocking     {pct(r.missed_by_blocking, r.true_pairs)}")
+        print(f"     removed by pruning     {pct(r.removed_by_pruning, r.true_pairs)}")
+        print(f"     rejected by model      {pct(r.rejected_by_model, r.true_pairs)}   mean p {r.p_rejected_true:.3f}")
+        print(f"   FP (wrong matches)       {r.FP:>10,} {100 * r.FP / max(r.TP + r.FP, 1):5.2f}% of predictions   mean p {r.p_FP:.3f}")
+        print(f"   TN (candidates rejected) {r.TN_candidates:>10,}         mean p {r.p_TN:.3f}")
+        print(f"   P {r.P:.4f}  R {r.R:.4f}  F0.5 {r.F05:.4f}")
+
+
+def permutation_report(bundle, c, X, y, s1_all, n_true, seed=0, max_pairs=500_000):
+    """Effect of each feature on held-out P / R / F0.5: shuffle that column (breaks its link to the
+    label), re-score, re-decide, compare. No retraining. Correlated features cover for each other,
+    so groups are shuffled together too."""
+    if len(c) > max_pairs:                          # hash-subsample S1 entities: ~1 min per feature
+        keep_s1 = pd.util.hash_array(s1_all.values, hash_key="permute000000000") % 10_000 < int(1e4 * max_pairs / len(c))
+        s1_all = s1_all[keep_s1]
+        m = c["s1_id"].isin(set(s1_all)).values
+        c, X, y = c[m].reset_index(drop=True), X[m].reset_index(drop=True), y[m]
+        print(f"\npermutation on a subsample: {len(s1_all):,} S1 entities, {len(c):,} pairs")
+    absent = s1_all[~s1_all.isin(set(c["s1_id"]))]
+    n_single = int((absent.map(n_true) == 0).sum())
+    ev = MacroF05(c["s1_id"].values, y, n_true.to_dict(), n_single, len(absent) - n_single)
+    d = c.assign(a_missing=X["a_missing"].values)
+
+    def score(Xp):
+        keep = decide(d, predict_p(bundle, Xp), bundle["thr"], bundle["fallback"], bundle["exclusive"],
+                      bundle.get("margin", 0.0))
+        return ev(keep)
+
+    base = score(X)
+    rng = np.random.default_rng(seed)
+    groups = {"ALL name similarity": [f for f in X.columns if f.startswith("n_")],
+              "ALL address similarity": [f for f in X.columns if f.startswith("a_") and f != "a_missing"],
+              "ALL blocking signals": [f for f in X.columns if f.startswith("blk_")],
+              "ALL chain ambiguity": [f for f in X.columns if f.startswith("amb_")]}
+    rows = [(f, [f]) for f in X.columns] + list(groups.items())
+    print(f"\npermutation effect on held-out (base P {base['P']:.4f} R {base['R']:.4f} macro F0.5 {base['e2e']:.4f})")
+    print(f"{'feature':26}{'dP':>9}{'dR':>9}{'dF0.5':>9}")
+    out = []
+    for name, fs in rows:
+        Xp = X.copy()
+        idx = rng.permutation(len(X))
+        for f in fs:
+            Xp[f] = X[f].values[idx]
+        r = score(Xp)
+        out.append((name, r["P"] - base["P"], r["R"] - base["R"], r["e2e"] - base["e2e"]))
+    for name, dp, dr, df in sorted(out, key=lambda t: t[3]):
+        print(f"{name:26}{dp:+9.4f}{dr:+9.4f}{df:+9.4f}")
+
+
 def parse_procs(items):
     o = {}
     for it in items or []:
@@ -733,7 +1064,7 @@ def main():
             p.add_argument("--save", action="store_true", help="write the re-tuned thresholds into the model bundle")
         else:
             p.add_argument("--thr-scale", type=float, default=1.0, help="multiply every threshold (<1: more recall)")
-    for name, fn in (("train", cmd_train), ("predict", cmd_predict)):
+    for name, fn in (("train", cmd_train), ("predict", cmd_predict), ("evaluate", cmd_evaluate)):
         p = sub.add_parser(name)
         p.set_defaults(fn=fn)
         p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
@@ -742,6 +1073,10 @@ def main():
         if name == "train":
             p.add_argument("--s1-frac", type=float, default=1.0, help="hash-sample of S1 entities to train on")
             p.add_argument("--folds", type=int, default=5, help="grouped CV folds (by S1 entity)")
+        elif name == "evaluate":
+            p.add_argument("--train-frac", type=float, default=0.5, help="the --s1-frac the saved model was trained with")
+            p.add_argument("--permute", action="store_true", help="also report each feature's effect on P / R / F0.5")
+            p.add_argument("--blocked-dir", default=None, help="copy of the candidates before pruning (splits FN into blocking vs pruning)")
         else:
             p.add_argument("--format", choices=["grouped"], default="grouped")  # only format the validator accepts
     a = ap.parse_args()
