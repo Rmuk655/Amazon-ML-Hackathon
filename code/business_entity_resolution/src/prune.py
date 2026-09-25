@@ -74,7 +74,8 @@ def apply_split(split, bundle, text=None, write_tsv=False):
     if text is None:
         ids = set()
         for f in files:
-            ids |= set(pd.read_parquet(f, columns=["s1_id", "cand_id"]).stack().astype(str))
+            x = pd.read_parquet(f, columns=["s1_id", "cand_id"])
+            ids.update(x["s1_id"].astype(str)); ids.update(x["cand_id"].astype(str))
         text = load_text(split, ids)
     before = after = tp_before = tp_after = 0
     for f in files:
@@ -108,12 +109,15 @@ def cmd_fit(a):
     n_all = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
     if n_all > FIT_MAX_PAIRS:
         frac = FIT_MAX_PAIRS / n_all
-    d = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-    if frac < 1.0:
-        d = d[pd.util.hash_array(d["s1_id"].values) % 10_000 < int(frac * 10_000)].reset_index(drop=True)
-    ids = set(d["s1_id"]) | set(d["cand_id"])
-    for f in files:                                     # text for the full apply pass too
-        ids |= set(pd.read_parquet(f, columns=["s1_id", "cand_id"]).stack().astype(str))
+    ids, sample = set(), []
+    for f in files:                                     # sample per file: never hold every candidate at once
+        x = pd.read_parquet(f)
+        ids.update(x["s1_id"].astype(str)); ids.update(x["cand_id"].astype(str))
+        if frac < 1.0:
+            x = x[pd.util.hash_array(x["s1_id"].values) % 10_000 < int(frac * 10_000)]
+        sample.append(x)
+    d = pd.concat(sample, ignore_index=True)
+    del sample
     text = load_text("train", ids)
     d = cheap_feats(d, text)
     feats = BLOCK_FEATS + CHEAP_FEATS
