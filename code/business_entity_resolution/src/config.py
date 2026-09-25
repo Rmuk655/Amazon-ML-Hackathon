@@ -14,6 +14,7 @@ OUTPUT_DIR = STUDENT_RESOURCE / "output"       # final submission files
 MODELS_DIR = CODE_DIR / "models"
 INDICLID_FTN_DIR = MODELS_DIR / "indiclid-ftn"  # unzip IndicLID FTN model here (any *.bin)
 PENDING_VOCAB = PROCESSED_DIR / "pending_vocab.tsv"   # (lang, token) pairs still to transliterate
+NAME_VOCAB = PROCESSED_DIR / "name_vocab.tsv"          # clean S1 name tokens for OCR repair (learn_suffixes.py)
 LEARNED_TOKENS = PROCESSED_DIR / "learned_tokens.tsv"  # legal forms / stopwords from learn_suffixes.py
 
 TRAIN_GT = DATASET_DIR / "train" / "train_ground_truth.tsv"

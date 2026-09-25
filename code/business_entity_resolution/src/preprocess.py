@@ -19,11 +19,23 @@ from tqdm import tqdm
 import config as C
 from canonical import name_keys
 from lang_id import NativeLID
-from text_utils import (INDIC_RE, dominant_indic_script, fold_latin, indic_part, normalize,
-                        normalize_address, scripts_present, split_scripts, tokenize)
+from text_utils import (INDIC_RE, OcrFixer, dominant_indic_script, fold_latin, indic_part, normalize,
+                        normalize_address, normalize_name, scripts_present, split_scripts, tokenize)
 from transliterate import Transliterator, write_pending
 
-FIELDS = (("business_name", normalize), ("business_address", normalize_address))
+FIELDS = (("business_name", normalize_name), ("business_address", normalize_address))
+
+
+def load_ocr_fixer():
+    """OCR repair for names needs the clean S1 vocabulary written by learn_suffixes.py."""
+    try:
+        with open(C.NAME_VOCAB, encoding="utf-8") as f:
+            vocab = {w: int(c) for w, c in (l.rstrip("\n").split("\t") for l in f)}
+        print(f"[ocr] name vocabulary: {len(vocab):,} tokens")
+        return OcrFixer(vocab)
+    except OSError:
+        print("[ocr] no name vocabulary (run learn_suffixes.py) -> OCR repair off")
+        return None
 
 
 def read_source(path, limit=None) -> pd.DataFrame:
@@ -117,6 +129,9 @@ def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
         df[f"{col}_rom"], df[f"{col}_script"], df[f"{col}_lang"] = n.map(rom), n.map(scr), n.map(lng)
         cols += [f"{col}_{k}" for k in ("norm", "rom", "script", "lang")]
 
+    if OCR is not None:                               # '5ervices' -> 'services' before canonical keys
+        u = df["business_name_rom"].unique()
+        df["business_name_rom"] = df["business_name_rom"].map(dict(zip(u, map(OCR, u))))
     rn = df["business_name_rom"]
     keys = {s: name_keys(s) for s in rn.unique()}
     for i, k in enumerate(("c4a", "c4b", "legal")):
@@ -129,6 +144,9 @@ def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
     os.replace(tmp, dst)                                      # atomic: no half-written outputs
     ind = df["business_name_script"].str.contains("|".join(C.SCRIPT_DEFAULT_LANG), regex=True).sum()
     print(f"[{src.name}] -> {dst.name} | names with Indic script: {ind:,} ({ind / len(df):.2%})")
+
+
+OCR = None
 
 
 def main():
@@ -144,6 +162,8 @@ def main():
     a = ap.parse_args()
 
     C.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    global OCR
+    OCR = load_ocr_fixer()
     lid = NativeLID()
     xlit = Transliterator(a.backend, a.beam_width, a.cache_only)
     for split in a.splits:

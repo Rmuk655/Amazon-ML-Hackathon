@@ -110,9 +110,69 @@ ADDRESS_ABBR = {
 }
 
 
+# Placeholders injected into otherwise valid fields ('NULL', '<NULL>', 'N/A' ~3% of S2/S3 addresses).
+_ADDR_PLACEHOLDER = re.compile(r"<\s*null\s*>|#?\bn\s*/\s*a\b|\bnot\s+available\b|\bnot\s+applicable\b", re.I)
+_WHOLE_PLACEHOLDER = re.compile(r"^\s*(?:null|nan|none|n\s*/?\s*a|nil|#n/a|unknown|undefined|-+|\.+|\?+)\s*$", re.I)
+_OCR_NUM = re.compile(r"(?=[0-9oil]*[0-9])(?=[0-9oil]*[oil])[0-9oil]{2,}")
+_OCR_NUM_MAP = str.maketrans("oil", "011")
+
+
+def _fix_number(tok):
+    """Letter-for-digit OCR in numbers: '3o5' -> '305', 'i30' -> '130' (token must be all 0-9/o/i/l)."""
+    return tok.translate(_OCR_NUM_MAP) if _OCR_NUM.fullmatch(tok) else tok
+
+
+def normalize_name(text) -> str:
+    """normalize() for names; a whole-field placeholder ('NA', 'NULL', 'N/A') means no name."""
+    if text is None or text != text or _WHOLE_PLACEHOLDER.match(str(text)):
+        return ""
+    return normalize(text)
+
+
 def normalize_address(text) -> str:
-    """normalize() + drop literal 'null'/'nan' tokens + unify street-type abbreviations."""
-    return " ".join(ADDRESS_ABBR.get(t, t) for t in normalize(text).split() if t not in ADDRESS_NOISE_TOKENS)
+    """normalize() + placeholder removal ('NULL', '<NULL>', 'N/A', 'nan') + street-type abbreviations
+    unified + letter-for-digit OCR repair inside numbers."""
+    if text is None or text != text or _WHOLE_PLACEHOLDER.match(str(text)):
+        return ""
+    t = _ADDR_PLACEHOLDER.sub(" ", str(text))
+    return " ".join(_fix_number(ADDRESS_ABBR.get(w, w)) for w in normalize(t).split() if w not in ADDRESS_NOISE_TOKENS)
+
+
+_DIGIT_RUN = re.compile(r"\d\d")
+
+
+class OcrFixer:
+    """Digit-for-letter OCR noise in names ('5ervices', 'c0m', 'Br0thers', 'Denta1', 'lnfra').
+    A token is rewritten only if it is NOT a known word and a variant IS: the vocabulary is the
+    clean Source-1 name tokens (train + test, no labels), so '3eme', '4x4', '3m' are left alone."""
+    OPTIONS = {"0": "o", "1": "li", "2": "z", "3": "e", "4": "a", "5": "s", "6": "g", "7": "t", "8": "b",
+               "9": "g", "l": "i", "i": "l"}
+
+    def __init__(self, vocab):
+        self.vocab = vocab                      # {token: count}
+        self.cache = {}
+
+    def _variants(self, tok):
+        out = [""]
+        for ch in tok:
+            opts = ch + self.OPTIONS.get(ch, "")
+            out = [o + c for o in out for c in opts]
+            if len(out) > 256:
+                return []
+        return out[1:]                           # first is the token itself
+
+    def fix_token(self, tok):
+        if tok in self.vocab or len(tok) < 3 or tok.isdigit() or _DIGIT_RUN.search(tok):
+            return tok                           # known word, too short, or a model number ('i10', 'a320')
+        if not (any(c.isdigit() for c in tok) or "l" in tok or "i" in tok):
+            return tok
+        if tok not in self.cache:
+            cand = [v for v in self._variants(tok) if v in self.vocab]
+            self.cache[tok] = max(cand, key=self.vocab.get) if cand else tok
+        return self.cache[tok]
+
+    def __call__(self, s):
+        return " ".join(self.fix_token(t) for t in s.split()) if s else s
 
 
 def fold_latin(seg: str) -> str:
