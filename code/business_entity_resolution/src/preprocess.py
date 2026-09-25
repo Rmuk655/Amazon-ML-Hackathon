@@ -100,6 +100,8 @@ def romanize_string(s, dom, lang, cache) -> str:
 
 def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
     df = read_source(src, limit)
+    if os.environ.get("BER_ONLY_COUNTRY"):             # dev: one country only (fast A/B runs)
+        df = df[df["country"].fillna("").str.lower() == os.environ["BER_ONLY_COUNTRY"].lower()].reset_index(drop=True)
     print(f"[{src.name}] {len(df):,} rows")
     for col, fn in FIELDS:
         m = {s: fn(s) for s in df[col].dropna().unique()}
