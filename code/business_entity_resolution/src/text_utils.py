@@ -62,9 +62,20 @@ def normalize(text) -> str:
     return " ".join("".join(out).casefold().split())
 
 
+# Street-type abbreviations -> one form. Applied identically to every source, so an imperfect
+# expansion ('st' -> 'street' even for 'saint') is harmless; it only has to be consistent.
+ADDRESS_ABBR = {
+    "r": "rue", "av": "avenue", "ave": "avenue", "bd": "boulevard", "bld": "boulevard",
+    "blvd": "boulevard", "all": "allée", "imp": "impasse", "pl": "place", "rte": "route",
+    "ch": "chemin", "chem": "chemin", "fg": "faubourg", "sq": "square", "st": "street",
+    "rd": "road", "dr": "drive", "ln": "lane", "ct": "court", "hwy": "highway", "pkwy": "parkway",
+    "ste": "suite", "nr": "near", "opp": "opposite",
+}
+
+
 def normalize_address(text) -> str:
-    """normalize() + drop literal 'null'/'nan' tokens that leaked into address text."""
-    return " ".join(t for t in normalize(text).split() if t not in ADDRESS_NOISE_TOKENS)
+    """normalize() + drop literal 'null'/'nan' tokens + unify street-type abbreviations."""
+    return " ".join(ADDRESS_ABBR.get(t, t) for t in normalize(text).split() if t not in ADDRESS_NOISE_TOKENS)
 
 
 def fold_latin(seg: str) -> str:
