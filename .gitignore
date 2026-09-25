@@ -11,3 +11,6 @@ code/business_entity_resolution/logs/
 models/
 output/*.tsv
 submission.zip
+# analysis-only (not for submission)
+code/business_entity_resolution/src/profile_data.py
+dataset/processed/eda/

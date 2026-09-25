@@ -33,6 +33,7 @@ from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 
 import config as C
+from text_utils import ADDRESS_ABBR
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))  # .../student_resource
@@ -78,7 +79,28 @@ FEATS = [
     "n_tok_jacc_rom", "n_first_tok_eq", "n_len_diff", "n_tok_cnt_diff", "n_partial_rom",
     "a_norm_tset", "a_rom_tset", "a_rom_partial", "a_tok_jacc_rom", "a_num_jacc", "a_pin_match",
     "a_pin_conflict", "c_eq", "n_missing", "a_missing",
+    # address signals that separate same-name chain branches (profile_data.py P4)
+    "a_house_eq", "a_house_conflict", "a_street_overlap", "a_abbr_tset", "a_abbr_jacc",
 ]
+_HOUSE = re.compile(r"\d{1,4}[a-z]?")
+STREET_TYPES = set(ADDRESS_ABBR.values()) | {"no", "near", "opposite", "floor", "building", "sector", "plot"}
+
+
+@lru_cache(maxsize=1_000_000)
+def addr_parts(addr):
+    """-> (abbreviation-unified address, house number or '', set of street words)."""
+    t = [ADDRESS_ABBR.get(w, w) for w in addr.split()]
+    house = next((w for w in t[:3] if _HOUSE.fullmatch(w)), "")
+    street = frozenset(w for w in t[:6] if w.isalpha() and len(w) >= 4 and w not in STREET_TYPES)
+    return " ".join(t), house, street
+
+
+def addr_feats(x, y):
+    if not x or not y:
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+    (ax, hx, sx), (ay, hy, sy) = addr_parts(x), addr_parts(y)
+    return [float(bool(hx) and hx == hy), float(bool(hx) and bool(hy) and hx != hy),
+            float(bool(sx & sy)), fuzz.token_set_ratio(ax, ay) / 100, jacc(ax.split(), ay.split())]
 
 
 def _feats(args):
@@ -114,6 +136,7 @@ def _feats(args):
                fuzz.partial_ratio(ar1, ar2) / 100 if ar1 and ar2 else 0.0,
                jacc(ar1.split(), ar2.split()), jacc(nums1, nums2), pin_match, pin_conf,
                float(bool(c1) and c1 == c2), n_miss, a_miss]
+            + addr_feats(ar1, ar2)
         )
         out[k] = row
     return out
@@ -286,6 +309,9 @@ def thr_of(thr, s, am):
     return thr.get((int(s), int(am)), thr.get(int(s), 0.5))
 
 
+MAX_PER_SOURCE = 6    # no train S1 has more than 5 S2 / 6 S3 matches (profile_data.py P5)
+
+
 class Decider:
     """Decision layer with everything threshold-independent precomputed, so the rule/threshold
     search can evaluate hundreds of settings quickly. Same rules as before:
@@ -322,15 +348,15 @@ class Decider:
         sub.low, sub.perm, sub.n_full, sub.idx = self.low, np.argsort(-sub.p, kind="stable"), len(self.p), idx
         return sub
 
-    def __call__(self, thr, fallback, exclusive, margin=0.0):
-        keep = self._keep(thr, fallback, exclusive, margin)
+    def __call__(self, thr, fallback, exclusive, margin=0.0, cap=None):
+        keep = self._keep(thr, fallback, exclusive, margin, MAX_PER_SOURCE if cap is None else cap)
         if getattr(self, "idx", None) is None:
             return keep
         full = np.zeros(self.n_full, bool)
         full[self.idx] = keep
         return full
 
-    def _keep(self, thr, fallback, exclusive, margin=0.0):
+    def _keep(self, thr, fallback, exclusive, margin=0.0, cap=MAX_PER_SOURCE):
         lut = np.array([[thr_of(thr, s_, a_) for a_ in (0, 1)] for s_ in range(4)])
         t = lut[np.clip(self.s, 0, 3), self.am]
         keep = self.p >= t
@@ -344,6 +370,10 @@ class Decider:
             _, first = np.unique(self.g_t[ks], return_index=True)
             keep = np.zeros(len(keep), bool)
             keep[ks[first]] = True
+        if cap:
+            ks = self.perm[keep[self.perm]]
+            over = ks[pd.Series(self.g_ss[ks]).groupby(self.g_ss[ks]).cumcount().to_numpy() >= cap]
+            keep[over] = False
         return keep
 
 
@@ -365,7 +395,8 @@ class MacroF05:
     still count as misses. extra_single / extra_other: S1 entities of the population that have
     no candidate at all (they score 1 / 0) - gives the end-to-end estimate."""
 
-    def __init__(self, s1, y, n_true=None, extra_single=0, extra_other=0):
+    def __init__(self, s1, y, n_true=None, extra_single=0, extra_other=0, fp_weight=1.0):
+        self.fp_weight = fp_weight
         self.codes, uniq = pd.factorize(pd.Series(s1).astype(str))
         self.G, self.y = len(uniq), np.asarray(y, bool)
         true_c = np.bincount(self.codes, weights=self.y, minlength=self.G)
@@ -377,6 +408,7 @@ class MacroF05:
         keep = np.asarray(keep, bool)
         tp = np.bincount(self.codes, weights=self.y & keep, minlength=self.G)
         pred = np.bincount(self.codes, weights=keep, minlength=self.G)
+        pred = tp + self.fp_weight * (pred - tp)          # fp_weight > 1: stress-test precision
         per = np.where((pred == 0) & (self.true == 0), 1.0,
                        fbeta(tp / np.maximum(pred, 1), tp / np.maximum(self.true, 1)))
         P = tp.sum() / max(pred.sum(), 1)
@@ -449,6 +481,23 @@ def predict_p(bundle, X):
 
 NEG_RATE = 0.2         # share of easy negatives kept for training (rest dropped, kept ones reweighted)
 HARD_NEG_SIM = 0.8     # negatives at least this similar (n_best) are always kept
+
+
+def decoy_ratio(n_true):
+    """How many more decoy targets per S1 test has than train, from row counts only (no test labels),
+    assuming test S1 entities have as many true matches as train ones. Used to up-weight false
+    positives when tuning thresholds, so train-tuned thresholds are not too lenient for test."""
+    try:
+        rows = lambda sp, n: pq.ParquetFile(C.processed_path(sp, n)).metadata.num_rows
+        m = float(n_true.mean())
+        per = {sp: (rows(sp, 2) + rows(sp, 3)) / rows(sp, 1) for sp in ("train", "test")}
+        r = (per["test"] - m) / max(per["train"] - m, 1e-6)
+        r = float(np.clip(r, 1.0, 3.0))
+        print(f"targets per S1: train {per['train']:.2f}, test {per['test']:.2f}; mean true matches {m:.2f} "
+              f"-> false-positive weight {r:.2f}")
+        return r
+    except OSError:
+        return 1.0
 
 
 def load_gt_counts(procs, id_override=None):
@@ -527,7 +576,9 @@ def cmd_train(a):
     s1_all = s1_all[s1_all.isin(n_true.index)]
     absent = s1_all[~s1_all.isin(set(c["s1_id"]))]
     n_abs_single = int((absent.map(n_true) == 0).sum())
-    ev = MacroF05(c["s1_id"].values, y, n_true.to_dict(), n_abs_single, len(absent) - n_abs_single)
+    fpw = decoy_ratio(n_true)
+    ev = MacroF05(c["s1_id"].values, y, n_true.to_dict(), n_abs_single, len(absent) - n_abs_single, fpw)
+    ev_plain = MacroF05(c["s1_id"].values, y, n_true.to_dict(), n_abs_single, len(absent) - n_abs_single)
     print(f"S1 population {len(s1_all):,}: {len(absent):,} without candidates "
           f"({n_abs_single:,} singletons score 1, the rest 0)")
 
@@ -547,8 +598,9 @@ def cmd_train(a):
     print(f"best rule: fallback={best[1]} exclusive={best[2]} margin={best[3]} macroF0.5(e2e)={best[0]:.4f}")
     thr, sc = tune_thresholds(ev, dec, thr, best[1], best[2], best[3])
     print(f"decision search done ({time.time() - t0:.0f}s)")
-    print("thresholds tuned on macro F0.5:", {str(k): round(v, 3) for k, v in thr.items()},
-          f"-> macroF0.5(e2e)={sc:.4f}  <- expected leaderboard score (OOF estimate)")
+    plain = ev_plain(dec(thr, best[1], best[2], best[3]))
+    print("thresholds tuned on decoy-weighted macro F0.5:", {str(k): round(v, 3) for k, v in thr.items()},
+          f"-> weighted {sc:.4f} | unweighted macroF0.5(e2e)={plain['e2e']:.4f} (P {plain['P']:.4f}, R {plain['R']:.4f})")
     best = (sc,) + best[1:]
 
     imp = getattr(models[0], "feature_importances_", None)
