@@ -202,7 +202,11 @@ def main():
     log("\n== 1.3 country consistency ==")
     flat["s1_country"] = flat[gid].map(allr["country"])
     flat["t_country"] = flat["target"].map(allr["country"])
-    cross = (flat["s1_country"] != flat["t_country"]).mean()
+    have13 = flat[gid].isin(allr.index) & flat["target"].isin(allr.index)
+    if not have13.all():
+        log(f"  note: {int((~have13).sum()):,} of {len(flat):,} GT pairs reference an id outside the "
+            f"loaded rows (likely due to --nrows); excluding them from the cross-country rate")
+    cross = (flat.loc[have13, "s1_country"] != flat.loc[have13, "t_country"]).mean()
     labels = sorted(allr["country"].dropna().unique())
     log("cross-country matches:", pct(cross))
     log(f"{len(labels)} country labels:", labels[:60])
@@ -221,7 +225,9 @@ def main():
         sc = sub[cols[k]["name"]].map(script_of)
         tab = pd.crosstab(sub[cols[k]["country"]], sc)
         log(f"S{k} (sample {len(sub):,}) country x script:\n{tab.head(15).to_string()}")
-    ps = flat.sample(min(a.pair_sample * 5, len(flat)), random_state=a.seed).copy()
+    have14 = flat[gid].isin(allr.index) & flat["target"].isin(allr.index)
+    fp = flat[have14]
+    ps = fp.sample(min(a.pair_sample * 5, len(fp)), random_state=a.seed).copy()
     ps["s1_script"] = ps[gid].map(allr["name"]).map(script_of)
     ps["t_script"] = ps["target"].map(allr["name"]).map(script_of)
     ct = pd.crosstab(ps["s1_script"], ps["t_script"])

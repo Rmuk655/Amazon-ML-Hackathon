@@ -51,7 +51,7 @@ def build(a):
         raise SystemExit("Train candidates lack is_true")
     procs = M.find_processed("train", M.parse_procs(a.proc_file))
     need = set(c["s1_id"]) | set(c["cand_id"])
-    tabs = {s: M.load_table(procs[s], need, a.id_col) for s in (1, 2, 3)}
+    tabs = M.load_tables(procs, need, a.id_col)
     X = M.compute_features(c, tabs, a.workers)
     meta = pd.concat([load_meta(procs[s], need, a.id_col) for s in (1, 2, 3)])
     meta = meta[~meta.index.duplicated()]
@@ -83,9 +83,10 @@ def fit_predict(X, y, tr, te, val_mod=5):
     return model.predict_proba(X[te])[:, 1], thr
 
 
-def metrics(y, keep):
-    p, r, f = M.prf(y, keep)
-    return pd.Series({"pos": int(y.sum()), "pairs": len(y), "P": p, "R": r, "F1": f})
+def metrics(y, keep, s1):
+    p, r, f, mf, mfx = M.prf(y, keep, s1)
+    return pd.Series({"pos": int(y.sum()), "pairs": len(y), "P": p, "R": r, "F0.5": f, "macroF0.5": mf,
+                      "macroF0.5_excl_single": mfx})
 
 
 # --------------------------------------------------------------------------- commands
@@ -96,16 +97,16 @@ def cmd_slices(a):
     p, thr = fit_predict(X, y, ~val, val)
     v = c[val].copy()
     v["keep"] = p >= thr
-    print(f"global threshold {thr:.3f}; overall:", metrics(v["y"].values, v["keep"].values).round(4).to_dict())
+    print(f"global threshold {thr:.3f}; overall:", metrics(v["y"].values, v["keep"].values, v["s1_id"].values).round(4).to_dict())
     rows = []
     for key in ("s1_country", "script_pair", "addr", "srcn"):
-        g = v.groupby(key).apply(lambda d: metrics(d["y"].values, d["keep"].values), include_groups=False)
+        g = v.groupby(key).apply(lambda d: metrics(d["y"].values, d["keep"].values, d["s1_id"].values), include_groups=False)
         g.insert(0, "slice", key)
         rows.append(g.reset_index().rename(columns={key: "value"}))
     out = pd.concat(rows, ignore_index=True)
     os.makedirs(EDA, exist_ok=True)
     out.to_csv(os.path.join(EDA, "robustness_slices.csv"), index=False)
-    big = out[out["pos"] >= a.min_pos].sort_values("F1")
+    big = out[out["pos"] >= a.min_pos].sort_values("macroF0.5")
     print(f"\nweakest slices (>= {a.min_pos} positives):")
     print(big.head(15).round(3).to_string(index=False))
     print("\nsaved eda/robustness_slices.csv")
@@ -127,22 +128,22 @@ def cmd_holdout(a):
         te = (c["s1_country"] == k).values
         tr = ~te
         p, thr = fit_predict(X, y, tr, te)
-        ho = metrics(y[te], p >= thr)
+        ho = metrics(y[te], p >= thr, c["s1_id"].values[te])
         r = ref[ref["s1_country"] == k]
-        idf = metrics(r["y"].values, r["keep"].values) if len(r) else pd.Series(dtype=float)
-        rows.append({"held_out": k, "pos": ho["pos"], "F1_heldout": ho["F1"], "F1_in_dist": idf.get("F1", np.nan),
+        idf = metrics(r["y"].values, r["keep"].values, r["s1_id"].values) if len(r) else pd.Series(dtype=float)
+        rows.append({"held_out": k, "pos": ho["pos"], "F05_heldout": ho["macroF0.5"], "F05_in_dist": idf.get("macroF0.5", np.nan),
                      "P_heldout": ho["P"], "R_heldout": ho["R"]})
     out = pd.DataFrame(rows)
-    out["drop"] = out["F1_in_dist"] - out["F1_heldout"]
+    out["drop"] = out["F05_in_dist"] - out["F05_heldout"]
     os.makedirs(EDA, exist_ok=True)
     out.to_csv(os.path.join(EDA, "robustness_holdout.csv"), index=False)
     print(out.round(3).to_string(index=False))
-    print(f"\nmean F1 drop when the country is unseen: {out['drop'].mean():.3f}")
+    print(f"\nmean macro-F0.5 drop when the country is unseen: {out['drop'].mean():.3f}")
     print("A large drop means country-specific artefacts are leaking into features; prefer script-agnostic ones.")
 
 
 def cmd_testshift(a):
-    sc = os.path.join(M.ROOT, "dataset", "processed", "matches_test_scored.parquet")
+    sc = str(M.C.PROCESSED_DIR / "matches_test_scored.parquet")
     if not os.path.exists(sc):
         raise SystemExit("Run matching.py predict first")
     m = pd.read_parquet(sc)
