@@ -28,7 +28,7 @@ from matching import addr_parts
 BLOCK_FEATS = ["src", "score", "mask", "rank", "tf_cos", "tf_rank", "fwd_n", "fwd_margin", "rev_rank",
                "rev_n", "rev_margin"]
 CHEAP_FEATS = ["c_name", "c_addr", "c_house"]
-MODEL = os.path.join(C.CODE_DIR.parents[1], "models", "pruner.joblib")
+MODEL = os.path.join(C.RUN_MODELS_DIR, "pruner.joblib")
 FIT_MAX_PAIRS = 6_000_000      # training sample (hash-sampled by S1 entity)
 
 
@@ -45,19 +45,22 @@ def load_text(split, ids):
         for b in pf.iter_batches(columns=cols, batch_size=1_000_000):
             x = b.to_pandas()
             out.append(x[x["entity_id"].isin(ids)])
-    t = pd.concat(out, ignore_index=True).drop_duplicates("entity_id").set_index("entity_id")
-    return t.fillna("")
+    t = pd.concat(out, ignore_index=True).drop_duplicates("entity_id").set_index("entity_id").fillna("")
+    parts = t["business_address_rom"].map({a: addr_parts(a) for a in t["business_address_rom"].unique()})
+    t["_addr0"] = [x[0] for x in parts]         # parsed once per record, not once per pair
+    t["_house"] = [x[1] for x in parts]
+    return t
 
 
 def cheap_feats(d, text):
-    a, b = text.reindex(d["s1_id"].values), text.reindex(d["cand_id"].values)
-    na, nb = a["business_name_c4b"].fillna("").to_numpy(object), b["business_name_c4b"].fillna("").to_numpy(object)
-    pa = [addr_parts(x) for x in a["business_address_rom"].fillna("")]
-    pb = [addr_parts(x) for x in b["business_address_rom"].fillna("")]
-    d["c_name"] = cpdist(na, nb, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
-    d["c_addr"] = cpdist([x[0] for x in pa], [x[0] for x in pb], scorer=fuzz.token_set_ratio, workers=-1,
+    ia, ib = text.index.get_indexer(d["s1_id"].values), text.index.get_indexer(d["cand_id"].values)
+    col = lambda c, i: np.where(i >= 0, text[c].to_numpy(object)[np.maximum(i, 0)], "")
+    d["c_name"] = cpdist(col("business_name_c4b", ia), col("business_name_c4b", ib), scorer=fuzz.token_set_ratio,
+                         workers=-1, dtype=np.float32) / 100
+    d["c_addr"] = cpdist(col("_addr0", ia), col("_addr0", ib), scorer=fuzz.token_set_ratio, workers=-1,
                          dtype=np.float32) / 100
-    d["c_house"] = np.array([float(bool(x[1]) and x[1] == y[1]) for x, y in zip(pa, pb)], np.float32)
+    ha, hb = col("_house", ia), col("_house", ib)
+    d["c_house"] = ((ha != "") & (ha == hb)).astype(np.float32)
     return d
 
 

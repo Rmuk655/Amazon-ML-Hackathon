@@ -30,6 +30,7 @@ K_PER_SOURCE per S1 and per source (S2 / S3) are kept.
 Partitions by country_norm (generic string label, nothing hard-coded); --cross-country to disable.
 """
 import argparse
+import gc
 import os
 import re
 import time
@@ -182,20 +183,18 @@ def group_ctx(key, score):
 
 
 def add_context(files, parts):
-    """Ambiguity features over a whole country partition, written back into its part files.
-    fwd_*: among this S1's candidates from the same source; rev_*: among all S1 entities that
-    proposed this target (the reverse direction - only visible once every S1 chunk is done)."""
+    """Reverse ambiguity features over a whole country partition, written back into its part files:
+    rev_*: among all S1 entities that proposed this target (only visible once every S1 chunk is done).
+    The forward ones (fwd_*: among this S1's candidates from the same source) are computed per chunk."""
     if not parts:
         return
-    s = np.concatenate([p[0] for p in parts]); t = np.concatenate([p[1] for p in parts])
-    src = np.concatenate([p[2] for p in parts]); v = np.concatenate([p[3] for p in parts])
-    _, fn, fm = group_ctx(s * 4 + src, v)
+    t = np.concatenate([p[0] for p in parts]); v = np.concatenate([p[1] for p in parts])
     rr, rn, rm = group_ctx(t, v)
+    del t, v
     a = 0
     for f, p in zip(files, parts):
         b = a + len(p[0])
         d = pd.read_parquet(f)
-        d["fwd_n"], d["fwd_margin"] = fn[a:b].astype(np.int16), fm[a:b].astype(np.float32)
         d["rev_rank"], d["rev_n"], d["rev_margin"] = (rr[a:b].astype(np.int16), rn[a:b].astype(np.int32),
                                                       rm[a:b].astype(np.float32))
         d.to_parquet(f, index=False)
@@ -328,8 +327,9 @@ def run(args):
         f.unlink()
 
     if C.WITHIN_COUNTRY and not args.cross_country:
-        parts = [(c, S1[S1.country_norm == c].reset_index(drop=True), T[T.country_norm == c].reset_index(drop=True))
-                 for c in sorted(S1.country_norm.unique()) if not args.countries or c in args.countries]
+        # built one country at a time (generator) so only the current partition is held in memory
+        parts = ((c, S1[S1.country_norm == c].reset_index(drop=True), T[T.country_norm == c].reset_index(drop=True))
+                 for c in sorted(S1.country_norm.unique()) if not args.countries or c in args.countries)
     else:
         parts = [("all", S1.reset_index(drop=True), T)]
 
@@ -382,7 +382,10 @@ def run(args):
                 cand["is_true"] = (codes[pos] == cand["pid"].to_numpy()) if len(codes) else False
                 for s in (2, 3):
                     st.pre_trunc[s] += int(((cand.is_true) & (cand.src == s)).sum())
-            cand = cand[(cand["rank"] < args.k) | (cand["tf_rank"] < C.TFIDF_K)].reset_index(drop=True)
+            # reverse top-K_REV: this target's best S1 entities in this chunk (a superset of its global top)
+            cand["t_rank"] = (cand.groupby("t")["score"].rank(method="first", ascending=False) - 1).to_numpy(np.int16)
+            cand = cand[(cand["rank"] < args.k) | (cand["tf_rank"] < C.TFIDF_K) | (cand["t_rank"] < C.K_REV)]
+            cand = cand.reset_index(drop=True)
             if A is not None:
                 cand["tf_cos"] = tfc.cos(A, cand["s"].to_numpy() - a, cand["t"].to_numpy())
             st.n_pairs += len(cand)
@@ -404,18 +407,24 @@ def run(args):
             out = pd.DataFrame({
                 "s1_id": s1_ids[cand["s"].to_numpy()], "cand_id": t_ids[cand["t"].to_numpy()],
                 "src": cand["src"].to_numpy(np.int8), "score": cand["score"].to_numpy(),
-                "mask": cand["mask"].to_numpy(np.int16), "rank": cand["rank"].to_numpy(np.int8)})
+                "mask": cand["mask"].to_numpy(np.int16), "rank": cand["rank"].to_numpy(np.int16),
+                "t_rank": cand["t_rank"].to_numpy(np.int16)})
             if "tf_cos" in cand.columns:
                 out["tf_cos"] = cand["tf_cos"].to_numpy(np.float32)
                 out["tf_rank"] = cand["tf_rank"].to_numpy(np.int8)
             if codes is not None:
                 out["is_true"] = cand["is_true"].to_numpy(np.int8)
+            # forward context: an S1's candidates all sit in this chunk, so compute it here
+            _, fn, fm = group_ctx(cand["s"].to_numpy(np.int64) * 4 + cand["src"].to_numpy(np.int64),
+                                  cand["score"].to_numpy(np.float32))
+            out["fwd_n"], out["fwd_margin"] = fn.astype(np.int16), fm.astype(np.float32)
             f = outdir / f"part-{pname}-{a // C.S1_CHUNK:04d}.parquet"
             out.to_parquet(f, index=False)
             ctx_files.append(f)
-            ctx_parts.append((cand["s"].to_numpy(np.int64), cand["t"].to_numpy(np.int64),
-                              cand["src"].to_numpy(np.int64), cand["score"].to_numpy(np.float32)))
+            ctx_parts.append((cand["t"].to_numpy(np.int32), cand["score"].to_numpy(np.float32)))
             print(f"   chunk {a // C.S1_CHUNK}: {len(out):,} pairs ({time.time() - t0:.0f}s)")
+        index = tfc = A = None                     # free the target index before the reverse pass
+        gc.collect()
         add_context(ctx_files, ctx_parts)
         del ctx_parts
 

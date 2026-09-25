@@ -145,6 +145,105 @@ def _feats(args):
     return out
 
 
+
+def _per_unique(arr, fn):
+    """fn applied once per distinct value -> list aligned with arr (strings repeat a lot)."""
+    codes, uniq = pd.factorize(pd.Series(arr, dtype=object), sort=False)
+    vals = np.empty(len(uniq), dtype=object)
+    vals[:] = [fn(u) for u in uniq]
+    return vals[codes]
+
+
+def _cp(a, b, scorer, workers, scale=100.0):
+    return cpdist(a, b, scorer=scorer, workers=workers, dtype=np.float64) / scale
+
+
+def _jacc_pairs(xs, ys):
+    """Set Jaccard of token lists per pair (0 if either is empty), via sparse binary rows."""
+    xs, ys = list(xs), list(ys)
+    n = len(xs)
+    toks = pd.Series(xs + ys, dtype=object).explode()
+    toks = toks[toks.notna()]
+    codes, _ = pd.factorize(toks.values)
+    rows = toks.index.to_numpy()
+    if len(codes) == 0:
+        return np.zeros(n)
+    Mx = sparse.csr_matrix((np.ones(len(codes)), (rows, codes)), shape=(2 * n, codes.max() + 1))
+    Mx.data[:] = 1.0                          # duplicates summed -> back to a set (binary)
+    Mx.sum_duplicates(); Mx.data[:] = 1.0
+    A, B = Mx[:n], Mx[n:]
+    inter = np.asarray(A.multiply(B).sum(axis=1)).ravel()
+    na, nb = np.asarray(A.sum(axis=1)).ravel(), np.asarray(B.sum(axis=1)).ravel()
+    union = na + nb - inter
+    return np.where((na > 0) & (nb > 0), inter / np.maximum(union, 1), 0.0)
+
+
+def _feats_vec_1(args):
+    return _feats_vec(args, 1)
+
+
+def _feats_vec(args, workers=-1):
+    """Same values as _feats (checked by test_feats_equal), but the string similarities run in
+    rapidfuzz's C batch API (cpdist, all cores) and per-string work is done once per distinct string."""
+    an, ar, aa, aar, ac, bn, br, ba, bar, bc = [np.asarray(x, dtype=object) for x in args]
+    n = len(an)
+    out = np.zeros((n, len(FEATS)), dtype=np.float32)
+    if n == 0:
+        return out
+    ne = lambda x: x != ""
+    w = workers
+    sk1, sk2 = _per_unique(ar, skel), _per_unique(br, skel)
+    t1, t2 = _per_unique(ar, str.split), _per_unique(br, str.split)
+    col = {f: None for f in FEATS}
+    col["n_norm_ratio"] = _cp(an, bn, fuzz.ratio, w)
+    col["n_norm_tset"] = _cp(an, bn, fuzz.token_set_ratio, w)
+    col["n_norm_tsort"] = _cp(an, bn, fuzz.token_sort_ratio, w)
+    col["n_norm_jw"] = _cp(an, bn, JaroWinkler.similarity, w, 1.0)
+    col["n_rom_ratio"] = _cp(ar, br, fuzz.ratio, w)
+    col["n_rom_tset"] = _cp(ar, br, fuzz.token_set_ratio, w)
+    col["n_rom_tsort"] = _cp(ar, br, fuzz.token_sort_ratio, w)
+    col["n_rom_jw"] = _cp(ar, br, JaroWinkler.similarity, w, 1.0)
+    col["n_skel_ratio"] = _cp(sk1, sk2, fuzz.ratio, w)
+    col["n_skel_tset"] = _cp(sk1, sk2, fuzz.token_set_ratio, w)
+    col["n_best"] = np.maximum.reduce([col["n_norm_tset"], col["n_rom_tset"], col["n_skel_tset"],
+                                       col["n_norm_ratio"], col["n_rom_ratio"]])
+    col["n_exact_norm"] = (ne(an) & (an == bn)).astype(np.float64)
+    col["n_exact_rom"] = (ne(ar) & (ar == br)).astype(np.float64)
+    s1a, s2a = np.asarray(sk1, dtype=object), np.asarray(sk2, dtype=object)
+    col["n_exact_skel"] = (ne(s1a) & (s1a == s2a)).astype(np.float64)
+    col["n_tok_jacc_rom"] = _jacc_pairs(t1, t2)
+    col["n_first_tok_eq"] = np.array([float(bool(x) and bool(y) and x[0] == y[0]) for x, y in zip(t1, t2)])
+    l1, l2 = np.array([len(x) for x in ar]), np.array([len(x) for x in br])
+    col["n_len_diff"] = np.abs(l1 - l2) / np.maximum(np.maximum(l1, l2), 1)
+    col["n_tok_cnt_diff"] = np.abs(np.array([len(x) for x in t1]) - np.array([len(x) for x in t2])).astype(np.float64)
+    both_r = ne(ar) & ne(br)
+    col["n_partial_rom"] = np.where(both_r, _cp(ar, br, fuzz.partial_ratio, w), 0.0)
+    col["a_norm_tset"] = np.where(ne(aa) & ne(ba), _cp(aa, ba, fuzz.token_set_ratio, w), 0.0)
+    both_ar = ne(aar) & ne(bar)
+    col["a_rom_tset"] = np.where(both_ar, _cp(aar, bar, fuzz.token_set_ratio, w), 0.0)
+    col["a_rom_partial"] = np.where(both_ar, _cp(aar, bar, fuzz.partial_ratio, w), 0.0)
+    col["a_tok_jacc_rom"] = _jacc_pairs(_per_unique(aar, str.split), _per_unique(bar, str.split))
+    j1 = [a + " " + b for a, b in zip(aa, aar)]
+    j2 = [a + " " + b for a, b in zip(ba, bar)]
+    col["a_num_jacc"] = _jacc_pairs(_per_unique(j1, _NUM.findall), _per_unique(j2, _NUM.findall))
+    p1, p2 = _per_unique(j1, lambda x: frozenset(_PIN.findall(x))), _per_unique(j2, lambda x: frozenset(_PIN.findall(x)))
+    col["a_pin_match"] = np.array([float(bool(x & y)) for x, y in zip(p1, p2)])
+    col["a_pin_conflict"] = np.array([float(bool(x) and bool(y) and not (x & y)) for x, y in zip(p1, p2)])
+    col["c_eq"] = (ne(ac) & (ac == bc)).astype(np.float64)
+    col["n_missing"] = (~((ne(an) | ne(ar)) & (ne(bn) | ne(br)))).astype(np.float64)
+    col["a_missing"] = (~((ne(aa) | ne(aar)) & (ne(ba) | ne(bar)))).astype(np.float64)
+    q1, q2 = _per_unique(aar, addr_parts), _per_unique(bar, addr_parts)
+    hx, hy = np.array([x[1] for x in q1], dtype=object), np.array([y[1] for y in q2], dtype=object)
+    col["a_house_eq"] = np.where(both_ar, ne(hx) & (hx == hy), False).astype(np.float64)
+    col["a_house_conflict"] = np.where(both_ar, ne(hx) & ne(hy) & (hx != hy), False).astype(np.float64)
+    col["a_street_overlap"] = np.where(both_ar, [bool(x[2] & y[2]) for x, y in zip(q1, q2)], False).astype(np.float64)
+    ab1, ab2 = [x[0] for x in q1], [y[0] for y in q2]
+    col["a_abbr_tset"] = np.where(both_ar, _cp(ab1, ab2, fuzz.token_set_ratio, w), 0.0)
+    col["a_abbr_jacc"] = np.where(both_ar, _jacc_pairs([x.split() for x in ab1], [y.split() for y in ab2]), 0.0)
+    for i, f in enumerate(FEATS):
+        out[:, i] = col[f]
+    return out
+
 # --------------------------------------------------------------------------- tables
 class Table:
     def __init__(self, df, id_col):
@@ -186,6 +285,7 @@ def load_tables(procs, need, id_override=None):
     (chain-name ambiguity: how many S1 entities share a core name)."""
     tabs = {s: load_table(procs[s], need, id_override) for s in (1, 2, 3)}
     col = COL_MAP["core"]
+    tabs["procs"] = procs
     tabs["core_counts"] = (pd.read_parquet(procs[1], columns=[col])[col].fillna("").value_counts()
                            if col in pq.ParquetFile(procs[1]).schema_arrow.names else pd.Series(dtype=int))
     return tabs
@@ -299,20 +399,50 @@ def _safe_div(a, b):
     return np.divide(a, b, out=np.zeros_like(a, dtype=np.float64), where=b > 0)
 
 
-def _vector_sims(a, b, char, fit_max=3_000_000, chunk=500_000):
-    """TF-IDF cosine and Jaccard for aligned text arrays a[i] vs b[i]. char=True: character trigrams
-    (within words) -> (cosine, plain trigram Jaccard); char=False: words -> (cosine, IDF-weighted
-    Jaccard). IDF is fitted on the distinct texts of this group (one country) - no labels used."""
+def _new_vectorizer(char):
+    return (TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), binary=True, norm=None, dtype=np.float32)
+            if char else TfidfVectorizer(token_pattern=r"\S+", binary=True, norm=None, dtype=np.float32))
+
+
+def fitted_vectorizers(procs, fit_max=3_000_000):
+    """{(country, field, char): TfidfVectorizer} fitted once per split on ALL records of that country
+    (S1+S2+S3 names / canonical addresses; no labels), cached next to the processed data. The same
+    pair therefore gets the same value in training, evaluation and prediction, whatever the batch."""
+    import hashlib, json
+    key = hashlib.md5(json.dumps(_file_sig([procs[n] for n in (1, 2, 3)])).encode()).hexdigest()[:12]
+    path = C.PROCESSED_DIR / f"tfidf_vectorizers_{key}.joblib"
+    if path.exists():
+        return joblib.load(path)
+    cols = ["business_name_rom", "business_address_rom", "country_norm"]
+    df = pd.concat([pd.read_parquet(procs[n], columns=cols) for n in (1, 2, 3)], ignore_index=True).fillna("")
+    out = {}
+    rng = np.random.default_rng(0)
+    for k, g in df.groupby("country_norm"):
+        names = pd.unique(g["business_name_rom"].to_numpy(object))
+        addrs = pd.unique(np.array([addr_canon(x, k) for x in pd.unique(g["business_address_rom"].to_numpy(object))],
+                                   dtype=object))
+        for field, texts in (("n", names), ("a", addrs)):
+            texts = texts[texts != ""]
+            if len(texts) > fit_max:
+                texts = texts[rng.choice(len(texts), fit_max, replace=False)]
+            for char in (True, False):
+                v = _new_vectorizer(char)
+                try:
+                    out[(k, field, char)] = v.fit(texts)
+                except ValueError:
+                    pass
+    joblib.dump(out, path)
+    print(f"  fitted TF-IDF vectorizers -> {path.name}")
+    return out
+
+
+def _vector_sims(a, b, char, vec, chunk=500_000):
+    """TF-IDF cosine and Jaccard for aligned text arrays a[i] vs b[i] with a prefitted vectorizer.
+    char=True: character trigrams (within words) -> (cosine, plain trigram Jaccard); char=False:
+    words -> (cosine, IDF-weighted Jaccard). Words unseen by the vectorizer are ignored."""
     codes, uniq = pd.factorize(np.concatenate([a, b]))
     n = len(a)
-    if len(uniq) == 0:
-        return np.zeros(n), np.zeros(n)
-    vec = (TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), binary=True, norm=None, dtype=np.float32)
-           if char else TfidfVectorizer(token_pattern=r"\S+", binary=True, norm=None, dtype=np.float32))
-    fit_on = uniq if len(uniq) <= fit_max else uniq[np.random.default_rng(0).choice(len(uniq), fit_max, replace=False)]
-    try:
-        vec.fit(fit_on)
-    except ValueError:                       # all texts empty
+    if len(uniq) == 0 or vec is None:
         return np.zeros(n), np.zeros(n)
     M = sparse.vstack([vec.transform(uniq[i:i + chunk]) for i in range(0, len(uniq), chunk)]).tocsr()
     B = M.copy()
@@ -371,11 +501,14 @@ def extra_features(c, tabs, ia, workers):
     F["n_tset_core"] = _edit_sim(co_a, co_b, fuzz.token_set_ratio, w) / 100
     F["a_lev_canon"] = _edit_sim(ca_a, ca_b, Levenshtein.normalized_similarity, w)
     F["a_tset_canon"] = _edit_sim(ca_a, ca_b, fuzz.token_set_ratio, w) / 100
-    for k in pd.unique(ctry):                   # TF-IDF fitted per country
+    vecs = fitted_vectorizers(tabs["procs"]) if "procs" in tabs else {}
+    for k in pd.unique(ctry):                   # TF-IDF weights fitted per country, once per split
         g = np.where(ctry == k)[0]
         for pre, (x, y) in (("n", (nr_a, nr_b)), ("a", (ca_a, ca_b))):
-            F.loc[g, f"{pre}_tfidf_char"], F.loc[g, f"{pre}_char3_jacc"] = _vector_sims(x[g], y[g], char=True)
-            F.loc[g, f"{pre}_tfidf_word"], F.loc[g, f"{pre}_idf_jacc"] = _vector_sims(x[g], y[g], char=False)
+            F.loc[g, f"{pre}_tfidf_char"], F.loc[g, f"{pre}_char3_jacc"] = _vector_sims(
+                x[g], y[g], True, vecs.get((k, pre, True)))
+            F.loc[g, f"{pre}_tfidf_word"], F.loc[g, f"{pre}_idf_jacc"] = _vector_sims(
+                x[g], y[g], False, vecs.get((k, pre, False)))
     jac, cov = np.zeros(n, np.float32), np.zeros(n, np.float32)
     for i, (x, y, k) in enumerate(zip(raw_a, raw_b, ctry)):
         if x and y:
@@ -387,10 +520,15 @@ def extra_features(c, tabs, ia, workers):
     return F
 
 
-def compute_features(c, tabs, workers, chunk=100_000):
+# Feature store: each group's columns are cached per candidate file and reused while the group's
+# code version and its inputs (candidate file + processed tables) are unchanged. Bump a group's
+# version when its code changes; a new group is computed alone and appended to the cache.
+FEATURE_GROUPS = {"base": 1, "amb": 1, "extra": 2}
+
+
+def _base_group(c, tabs, workers, ia, chunk=25_000):
     n = len(c)
     X = np.full((n, len(FEATS)), np.nan, dtype=np.float32)
-    ia = tabs[1].pos(c["s1_id"].values)
     for s in (2, 3):
         m = np.where(c["srcn"].values == s)[0]
         if len(m) == 0:
@@ -409,31 +547,87 @@ def compute_features(c, tabs, workers, chunk=100_000):
                 yield tuple([T1[k][pa[sl]].tolist() for k in TEXT_COLS[:4] + ["country_norm"]]
                             + [TB[k][ib[sl]].tolist() for k in TEXT_COLS[:4] + ["country_norm"]])
 
-        if workers > 1:
+        if workers > 1:                  # chunks in parallel processes; cpdist single-threaded inside each
             with Pool(workers) as p:
-                res = list(p.imap(_feats, gen()))
+                res = list(p.imap(_feats_vec_1, gen()))
         else:
-            res = [_feats(a) for a in gen()]
+            res = [_feats_vec_1(a) for a in gen()]
         if res:
             X[m] = np.vstack(res)
-    F = pd.DataFrame(X, columns=FEATS)
-    F["srcn"] = c["srcn"].values
-    # chain-name ambiguity: a target whose core name is shared by many S1 entities is risky
+    return pd.DataFrame(X, columns=FEATS)
+
+
+def _amb_group(c, tabs, ia):
+    """Chain-name ambiguity: a target whose core name is shared by many S1 entities is risky."""
+    n = len(c)
     cc = tabs.get("core_counts")
-    if cc is not None and len(cc):
-        def core_at(tab, pos):                  # pos -1 = id not loaded -> ""
-            v = tab.cols["core"][np.maximum(pos, 0)] if len(tab.index) else np.array([""] * len(pos), dtype=object)
-            return np.where(pos >= 0, v, "")
-        core_a = pd.Series(core_at(tabs[1], ia), dtype=object)
-        core_b = pd.Series([""] * n, dtype=object)
-        for s in (2, 3):
-            m = np.where(c["srcn"].values == s)[0]
-            core_b.iloc[m] = core_at(tabs[s], tabs[s].pos(c["cand_id"].values[m]))
-        F["amb_s1_core_freq"] = core_a.map(cc).fillna(0).values.astype(np.float32)
-        F["amb_t_core_freq"] = core_b.map(cc).fillna(0).values.astype(np.float32)
-        F["amb_core_eq"] = (core_a.values == core_b.values) & (core_a.values != "")
+    if cc is None or not len(cc):
+        return pd.DataFrame(index=range(n))
+
+    def core_at(tab, pos):                  # pos -1 = id not loaded -> ""
+        v = tab.cols["core"][np.maximum(pos, 0)] if len(tab.index) else np.array([""] * len(pos), dtype=object)
+        return np.where(pos >= 0, v, "")
+    core_a = pd.Series(core_at(tabs[1], ia), dtype=object)
+    core_b = pd.Series([""] * n, dtype=object)
+    for s in (2, 3):
+        m = np.where(c["srcn"].values == s)[0]
+        core_b.iloc[m] = core_at(tabs[s], tabs[s].pos(c["cand_id"].values[m]))
+    return pd.DataFrame({"amb_s1_core_freq": core_a.map(cc).fillna(0).values.astype(np.float32),
+                         "amb_t_core_freq": core_b.map(cc).fillna(0).values.astype(np.float32),
+                         "amb_core_eq": (core_a.values == core_b.values) & (core_a.values != "")})
+
+
+def _file_sig(paths):
+    out = []
+    for p in paths:
+        if os.path.exists(p):
+            st = os.stat(p)
+            out.append([str(p), st.st_size, st.st_mtime_ns])
+    return out
+
+
+def feature_cache(split, tag, cand_paths, procs):
+    """Cache spec for compute_features (None when BER_FEATURE_CACHE=0)."""
+    if os.environ.get("BER_FEATURE_CACHE", "1") == "0":
+        return None
+    d = C.PROCESSED_DIR / f"features_{split}"
+    d.mkdir(parents=True, exist_ok=True)
+    return {"path": d / f"{tag}.parquet", "inputs": _file_sig(list(cand_paths) + [procs[n] for n in (1, 2, 3)])}
+
+
+def compute_features(c, tabs, workers, cache=None):
+    import json
+    ia = tabs[1].pos(c["s1_id"].values)
+    groups = {"base": lambda: _base_group(c, tabs, workers, ia), "amb": lambda: _amb_group(c, tabs, ia)}
     if EXTRA:
-        F = pd.concat([F, extra_features(c, tabs, ia, workers)], axis=1)
+        groups["extra"] = lambda: extra_features(c, tabs, ia, workers)
+    rowkey = str(int(pd.util.hash_array((c["s1_id"].astype(str) + "|" + c["cand_id"].astype(str)).values).sum()))
+    old, meta = None, {}
+    if cache is not None and cache["path"].exists() and cache["path"].with_suffix(".json").exists():
+        meta = json.loads(cache["path"].with_suffix(".json").read_text())
+        if meta.get("rows") == len(c) and meta.get("rowkey") == rowkey:
+            old = pd.read_parquet(cache["path"])
+        else:
+            meta = {}
+    parts, done, fresh = {}, [], []
+    for g, fn in groups.items():
+        sig = [FEATURE_GROUPS[g], cache["inputs"]] if cache is not None else None
+        m = meta.get("groups", {}).get(g)
+        if old is not None and m is not None and m["sig"] == sig and all(col in old for col in m["cols"]):
+            parts[g] = old[m["cols"]].reset_index(drop=True)
+            done.append(g)
+        else:
+            parts[g] = fn().reset_index(drop=True)
+            fresh.append(g)
+    if cache is not None and fresh:
+        keep = {g: {"sig": [FEATURE_GROUPS[g], cache["inputs"]], "cols": list(parts[g].columns)} for g in parts}
+        pd.concat(list(parts.values()), axis=1).to_parquet(cache["path"], index=False)
+        cache["path"].with_suffix(".json").write_text(json.dumps({"rows": len(c), "rowkey": rowkey, "groups": keep}))
+    if cache is not None:
+        print(f"  features: reused {done or '-'}, computed {fresh or '-'} ({cache['path'].name})")
+    F = parts["base"]
+    F["srcn"] = c["srcn"].values
+    F = pd.concat([F] + [parts[g] for g in groups if g != "base"], axis=1)
     for col in c.columns:
         if col not in RESERVED and col != "srcn" and pd.api.types.is_numeric_dtype(c[col]):
             F["blk_" + col] = c[col].values
@@ -444,7 +638,7 @@ def compute_features(c, tabs, workers, chunk=100_000):
 def make_model():
     try:
         import lightgbm as lgb
-        return lgb.LGBMClassifier(n_estimators=1500, learning_rate=0.05, num_leaves=63, subsample=0.8,
+        return lgb.LGBMClassifier(n_estimators=1500, learning_rate=C.LGB_LEARNING_RATE, num_leaves=63, subsample=0.8,
                                   subsample_freq=1, colsample_bytree=0.8, min_child_samples=40,
                                   reg_lambda=1.0, max_bin=63, force_col_wise=True, n_jobs=-1,
                                   verbose=-1), True
@@ -470,6 +664,21 @@ def thr_of(thr, s, am):
 
 
 SAVE_FLOOR = 0.05     # predict keeps every test pair scored at least this (for `decide`)
+# saved with every scored test pair: key similarities, conflict flags and the blocking evidence
+TRACE_COLS = ["n_best", "n_tok_jacc_rom", "n_rom_tset", "a_tok_jacc_rom", "a_rom_tset", "a_num_jacc",
+              "a_house_eq", "a_house_conflict", "a_pin_conflict", "amb_s1_core_freq", "blk_prune_p", "blk_mask",
+              "blk_rank", "blk_t_rank", "blk_tf_cos", "blk_rev_n", "blk_rev_margin"]
+BLOCK_KEY_NAMES = ["core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf"]
+
+
+def blocking_keys(mask):
+    """blk_mask bits -> 'core+nameaddr+...' (which blocking keys proposed the pair)."""
+    m = np.asarray(mask, dtype=np.int64)
+    out = np.full(len(m), "", dtype=object)
+    for i, k in enumerate(BLOCK_KEY_NAMES):
+        hit = (m >> i) & 1 == 1
+        out[hit] = np.where(out[hit] == "", k, out[hit] + "+" + k)
+    return out
 MAX_PER_SOURCE = 6    # no train S1 has more than 5 S2 / 6 S3 matches (profile_data.py P5)
 
 
@@ -687,7 +896,7 @@ def cmd_train(a):
     procs = find_processed("train", parse_procs(a.proc_file))
     need = set(c["s1_id"]) | set(c["cand_id"])
     tabs = load_tables(procs, need, a.id_col)
-    X = compute_features(c, tabs, a.workers)
+    X = compute_features(c, tabs, a.workers, feature_cache("train", f"train_frac{a.s1_frac}", files, procs))
     print(f"features done in {time.time() - t0:.0f}s")
     ok = ~X[FEATS].isna().all(axis=1).values
     c, X, y = c[ok].reset_index(drop=True), X[ok].reset_index(drop=True), y[ok]
@@ -773,15 +982,15 @@ def cmd_train(a):
     if imp is not None:
         top = sorted(zip(X.columns, imp), key=lambda z: -z[1])[:15]
         print("top features:", ", ".join(f"{k}({v})" for k, v in top))
-    os.makedirs(os.path.join(ROOT, "models"), exist_ok=True)
-    out = os.path.join(ROOT, "models", "stage4_model.joblib")
+    os.makedirs(C.RUN_MODELS_DIR, exist_ok=True)
+    out = os.path.join(C.RUN_MODELS_DIR, "stage4_model.joblib")
     joblib.dump({"models": models, "calibrator": cal, "feats": list(X.columns), "thr": thr,
                  "fallback": best[1], "exclusive": best[2], "margin": best[3]}, out)
     print("saved", out)
 
 
 def cmd_predict(a):
-    bundle = joblib.load(os.path.join(ROOT, "models", "stage4_model.joblib"))
+    bundle = joblib.load(os.path.join(C.RUN_MODELS_DIR, "stage4_model.joblib"))
     if "models" not in bundle:                         # older single-model bundle
         bundle = dict(bundle, models=[bundle["model"]], calibrator=None, margin=0.0)
     cols, thr = bundle["feats"], bundle["thr"]
@@ -796,14 +1005,18 @@ def cmd_predict(a):
     kept = []
     for i, f in enumerate(files):
         c = read_cand_file(f)
-        X = compute_features(c, tabs, a.workers)
+        X = compute_features(c, tabs, a.workers, feature_cache("test", os.path.basename(f)[:-8], [f], procs))
         for col in cols:
             if col not in X.columns:
                 X[col] = np.nan
         p = predict_p(bundle, X[cols])
         m = p >= floor
-        kept.append(pd.DataFrame({"s1_id": c["s1_id"].values[m], "cand_id": c["cand_id"].values[m],
-                                  "srcn": c["srcn"].values[m], "a_missing": X["a_missing"].values[m], "p": p[m]}))
+        kd = pd.DataFrame({"s1_id": c["s1_id"].values[m], "cand_id": c["cand_id"].values[m],
+                           "srcn": c["srcn"].values[m], "a_missing": X["a_missing"].values[m], "p": p[m]})
+        for col in TRACE_COLS:               # why the pair scored what it did (decision trace)
+            if col in X.columns:
+                kd[col] = X[col].values[m]
+        kept.append(kd)
         print(f"[{i + 1}/{len(files)}] {os.path.basename(f)}: {len(c):,} pairs, {m.sum():,} above floor")
     allp = pd.concat(kept, ignore_index=True)
     allp.to_parquet(C.PROCESSED_DIR / "scored_test.parquet", index=False)
@@ -826,11 +1039,15 @@ def write_results(allp, bundle):
     g.columns = ["source1_entity_id", "matched_entity_ids"]
     g.to_csv(out, sep="\t", index=False)
     res.to_parquet(C.PROCESSED_DIR / "matches_test_scored.parquet", index=False)
+    trace = allp.assign(decision=np.where(keep, "match", "reject"), source="model")
+    if "blk_mask" in trace:
+        trace["blocking_keys"] = blocking_keys(trace["blk_mask"].fillna(0).values)
+    trace.to_parquet(C.PROCESSED_DIR / "decision_trace_test.parquet", index=False)
     print(f"wrote {out}: {res['s1_id'].nunique():,} S1 entities matched, {len(res):,} pairs")
 
 
 def load_bundle():
-    return joblib.load(os.path.join(ROOT, "models", "stage4_model.joblib"))
+    return joblib.load(os.path.join(C.RUN_MODELS_DIR, "stage4_model.joblib"))
 
 
 def cmd_retune(a):
@@ -860,7 +1077,7 @@ def cmd_retune(a):
     print("thresholds:", {str(k): round(v, 3) for k, v in thr.items()})
     if a.save:
         bundle.update(thr=thr, fallback=best[1], exclusive=best[2], margin=best[3])
-        joblib.dump(bundle, os.path.join(ROOT, "models", "stage4_model.joblib"))
+        joblib.dump(bundle, os.path.join(C.RUN_MODELS_DIR, "stage4_model.joblib"))
         print("updated models/stage4_model.joblib (run `matching.py decide` to rewrite the results)")
 
 
@@ -882,10 +1099,11 @@ def cmd_evaluate(a):
     cols = bundle["feats"]
     procs = find_processed("train", parse_procs(a.proc_file))
     cut = int(a.train_frac * 10_000)
-    c = pd.concat([read_cand_file(f) for f in cand_files("train")], ignore_index=True)
+    files = cand_files("train")
+    c = pd.concat([read_cand_file(f) for f in files], ignore_index=True)
     c = c[pd.util.hash_array(c["s1_id"].values) % 10_000 >= cut].reset_index(drop=True)
     tabs = load_tables(procs, set(c["s1_id"]) | set(c["cand_id"]), a.id_col)
-    X = compute_features(c, tabs, a.workers)
+    X = compute_features(c, tabs, a.workers, feature_cache("train", f"evaluate_{a.train_frac}", files, procs))
     for col in cols:
         if col not in X.columns:
             X[col] = np.nan
