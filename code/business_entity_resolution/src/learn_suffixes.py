@@ -1,4 +1,5 @@
-"""Learn legal-form tokens and stopwords from the data (no labels, no hard-coded language).
+"""Learn legal-form tokens and stopwords from the data (no labels, no hard-coded language), and the
+clean Source-1 name vocabulary used by preprocess.py to repair OCR noise ('5ervices' -> 'services').
 
 Legal forms sit at a name boundary and are short: 'sci', 'ei', 'ets' (France), 'pllc', 'pc'
 (US). Per country, a token is learned as a legal form when it is the first or last token of
@@ -35,11 +36,15 @@ def tokens(s):
 def main():
     first, last, anywhere = (collections.defaultdict(collections.Counter) for _ in range(3))
     n = collections.Counter()
+    vocab = collections.Counter()               # clean Source-1 name tokens -> OCR repair in preprocess
     for split in ("train", "test"):
         for k in (1, 2, 3):
             path = C.source_path(split, k)
             d = pd.read_csv(path, sep="\t", usecols=["business_name", "country"], dtype=str,
                             keep_default_na=False, quoting=3)
+            if k == 1:
+                for s in d["business_name"].unique():
+                    vocab.update(fold_latin(normalize(s)).split())
             for ctry, g in d.groupby("country"):
                 names = g["business_name"]
                 names = names.sample(min(len(names), SAMPLE_PER_FILE_COUNTRY), random_state=0)
@@ -68,6 +73,11 @@ def main():
     out = pd.DataFrame(rows, columns=["kind", "token", "country", "position", "share"])
     out = out.sort_values(["kind", "share"], ascending=[True, False]).drop_duplicates(["kind", "token"])
     C.LEARNED_TOKENS.parent.mkdir(parents=True, exist_ok=True)
+    with open(C.NAME_VOCAB, "w", encoding="utf-8") as f:
+        for w, c in vocab.items():
+            if c >= 2 and not w.isdigit():       # alphanumerics too: '4x4', 'b2b' stay untouched
+                f.write(f"{w}\t{c}\n")
+    print(f"-> {C.NAME_VOCAB} ({sum(1 for w, c in vocab.items() if c >= 2 and not w.isdigit()):,} tokens)")
     out.to_csv(C.LEARNED_TOKENS, sep="\t", index=False)
     print(out.to_string(index=False))
     print(f"-> {C.LEARNED_TOKENS}  (now re-run preprocess.py --overwrite so c4b uses them)")

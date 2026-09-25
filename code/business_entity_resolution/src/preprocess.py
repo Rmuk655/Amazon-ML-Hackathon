@@ -19,11 +19,23 @@ from tqdm import tqdm
 import config as C
 from canonical import name_keys
 from lang_id import NativeLID
-from text_utils import (INDIC_RE, dominant_indic_script, fold_latin, indic_part, normalize,
-                        normalize_address, scripts_present, split_scripts, tokenize)
+from text_utils import (INDIC_RE, OcrFixer, dominant_indic_script, fold_latin, indic_part, normalize,
+                        normalize_address, normalize_name, scripts_present, split_scripts, tokenize)
 from transliterate import Transliterator, write_pending
 
-FIELDS = (("business_name", normalize), ("business_address", normalize_address))
+FIELDS = (("business_name", normalize_name), ("business_address", normalize_address))
+
+
+def load_ocr_fixer():
+    """OCR repair for names needs the clean S1 vocabulary written by learn_suffixes.py."""
+    try:
+        with open(C.NAME_VOCAB, encoding="utf-8") as f:
+            vocab = {w: int(c) for w, c in (l.rstrip("\n").split("\t") for l in f)}
+        print(f"[ocr] name vocabulary: {len(vocab):,} tokens")
+        return OcrFixer(vocab)
+    except OSError:
+        print("[ocr] no name vocabulary (run learn_suffixes.py) -> OCR repair off")
+        return None
 
 
 def read_source(path, limit=None) -> pd.DataFrame:
@@ -117,6 +129,9 @@ def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
         df[f"{col}_rom"], df[f"{col}_script"], df[f"{col}_lang"] = n.map(rom), n.map(scr), n.map(lng)
         cols += [f"{col}_{k}" for k in ("norm", "rom", "script", "lang")]
 
+    if OCR is not None:                               # '5ervices' -> 'services' before canonical keys
+        u = df["business_name_rom"].unique()
+        df["business_name_rom"] = df["business_name_rom"].map(dict(zip(u, map(OCR, u))))
     rn = df["business_name_rom"]
     keys = {s: name_keys(s) for s in rn.unique()}
     for i, k in enumerate(("c4a", "c4b", "legal")):
@@ -131,6 +146,9 @@ def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
     print(f"[{src.name}] -> {dst.name} | names with Indic script: {ind:,} ({ind / len(df):.2%})")
 
 
+OCR = None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--splits", nargs="+", default=["train", "test"])
@@ -141,18 +159,36 @@ def main():
     ap.add_argument("--dump-vocab", action="store_true", help="only write pending_vocab.tsv (no transliteration)")
     ap.add_argument("--cache-only", action="store_true", help="never call IndicXlit; unknown tokens use unidecode")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--jobs", type=int, default=3, help="files processed in parallel (~10 GB RAM each)")
     a = ap.parse_args()
 
     C.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    lid = NativeLID()
-    xlit = Transliterator(a.backend, a.beam_width, a.cache_only)
+    todo = []
     for split in a.splits:
         for n in a.sources:
             dst = C.processed_path(split, n)
             if dst.exists() and not a.overwrite and not a.dump_vocab:
                 print(f"[skip] {dst.name} exists (use --overwrite)")
                 continue
-            process_file(C.source_path(split, n), dst, lid, xlit, a.limit, a.dump_vocab)
+            todo.append((split, n))
+    # files are independent -> run them in parallel (each ~10 GB peak); vocab dumping and
+    # engine transliteration write shared files, so those stay sequential
+    jobs = 1 if (a.dump_vocab or not a.cache_only and a.backend == "indicxlit") else max(1, a.jobs)
+    if jobs > 1 and len(todo) > 1:
+        from multiprocessing import get_context
+        with get_context("spawn").Pool(min(jobs, len(todo))) as pool:
+            pool.starmap(_run_one, [(sp, n, a) for sp, n in todo])
+    else:
+        for sp, n in todo:
+            _run_one(sp, n, a)
+
+
+def _run_one(split, n, a):
+    global OCR
+    if OCR is None:
+        OCR = load_ocr_fixer()
+    process_file(C.source_path(split, n), C.processed_path(split, n), NativeLID(),
+                 Transliterator(a.backend, a.beam_width, a.cache_only), a.limit, a.dump_vocab)
 
 
 if __name__ == "__main__":
