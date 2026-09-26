@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from functools import lru_cache
 from multiprocessing import Pool
 
@@ -41,11 +42,12 @@ from text_utils import ADDRESS_ABBR, normalize_address
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))  # .../student_resource
 # Short internal feature-column names -> actual column names written by preprocess.py.
-TEXT_COLS = ["name_norm", "name_rom", "addr_norm", "addr_rom", "country_norm", "core", "addr_raw"]
+TEXT_COLS = ["name_norm", "name_rom", "addr_norm", "addr_rom", "country_norm", "core", "addr_raw", "legal"]
 COL_MAP = {
     "name_norm": "business_name_norm", "name_rom": "business_name_rom",
     "addr_norm": "business_address_norm", "addr_rom": "business_address_rom",
     "country_norm": "country_norm", "core": "business_name_c4b", "addr_raw": "business_address",
+    "legal": "business_name_legal",
 }
 ID_CANDIDATES = ["entity_id", "id", "source_entity_id", "record_id", "uid"]
 RESERVED = {"s1_id", "cand_id", "src", "is_true"}
@@ -523,7 +525,61 @@ def extra_features(c, tabs, ia, workers):
 # Feature store: each group's columns are cached per candidate file and reused while the group's
 # code version and its inputs (candidate file + processed tables) are unchanged. Bump a group's
 # version when its code changes; a new group is computed alone and appended to the cache.
-FEATURE_GROUPS = {"base": 1, "amb": 1, "extra": 2}
+FEATURE_GROUPS = {"base": 1, "amb": 1, "extra": 2, "decoy": 1}
+DECOY = os.environ.get("BER_DECOY_FEATS", "1") != "0"
+DECOY_FEATS = ["d_house_delta", "d_house_off_small", "d_num_mismatch", "d_one_word_swap", "d_swap_real_words",
+               "d_legal_conflict", "d_extra_word", "d_missing_word", "d_core_tok_diff"]
+_HN = re.compile(r"\d+(?:[/-]\d+)*[a-z]?")
+_LEGAL_CANON = {"pvt": "private", "ltd": "limited", "co": "company", "corp": "corporation", "inc": "incorporated"}
+
+
+@lru_cache(maxsize=1)
+def _name_vocab():
+    try:
+        with open(C.NAME_VOCAB, encoding="utf-8") as f:
+            return {w: int(c) for w, c in (l.rstrip("\n").split("\t") for l in f) if c.isdigit()}
+    except OSError:
+        return {}
+
+
+def decoy_pair(core1, core2, legal1, legal2, addr1, addr2, vocab):
+    """Signals of the decoy generator (a decoy is an S1 record with ONE detail changed): house number off by a
+    small amount, numbers disagreeing, exactly one real word swapped for another real word, legal form changed,
+    one word added / dropped."""
+    out = [np.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    h1, h2 = _HN.findall(addr1), _HN.findall(addr2)
+    if h1 and h2:
+        a_, b_ = re.findall(r"\d+", h1[0]), re.findall(r"\d+", h2[0])
+        if len(a_) == len(b_) and a_[:-1] == b_[:-1]:
+            out[0] = float(abs(int(a_[-1]) - int(b_[-1])))
+            out[1] = float(0 < out[0] <= 10)
+        n1, n2 = Counter(re.findall(r"\d+", addr1)), Counter(re.findall(r"\d+", addr2))
+        out[2] = float(sum(((n1 - n2) + (n2 - n1)).values()))
+    t1, t2 = core1.split(), core2.split()
+    if len(t1) == len(t2) and len(t1) >= 2:
+        diff = [(x, y) for x, y in zip(t1, t2) if x != y]
+        if len(diff) == 1:
+            x, y = diff[0]
+            out[3] = 1.0
+            out[4] = float(vocab.get(x, 0) >= 20 and vocab.get(y, 0) >= 20 and Levenshtein.normalized_similarity(x, y) < 0.6)
+    l1 = {_LEGAL_CANON.get(w, w) for w in legal1.split()}
+    l2 = {_LEGAL_CANON.get(w, w) for w in legal2.split()}
+    out[5] = float(bool(l1) and bool(l2) and l1 != l2)
+    s1, s2 = set(t1), set(t2)
+    out[6] = float(len(t2) == len(t1) + 1 and s1 <= s2)
+    out[7] = float(len(t1) == len(t2) + 1 and s2 <= s1)
+    out[8] = float(abs(len(t1) - len(t2)))
+    return out
+
+
+def decoy_features(c, tabs, ia):
+    vocab = _name_vocab()
+    cols = {}
+    for k in ("core", "legal", "addr_rom"):
+        cols[k] = _pair_texts(c, tabs, ia, k)
+    rows = [decoy_pair(a1, b1, a2, b2, a3, b3, vocab) for a1, b1, a2, b2, a3, b3 in
+            zip(*cols["core"], *cols["legal"], *cols["addr_rom"])] if len(c) else []
+    return pd.DataFrame(np.asarray(rows, dtype=np.float32).reshape(-1, len(DECOY_FEATS)), columns=DECOY_FEATS)
 
 
 def _base_group(c, tabs, workers, ia, chunk=25_000):
@@ -601,6 +657,8 @@ def compute_features(c, tabs, workers, cache=None):
     groups = {"base": lambda: _base_group(c, tabs, workers, ia), "amb": lambda: _amb_group(c, tabs, ia)}
     if EXTRA:
         groups["extra"] = lambda: extra_features(c, tabs, ia, workers)
+    if DECOY:
+        groups["decoy"] = lambda: decoy_features(c, tabs, ia)
     rowkey = str(int(pd.util.hash_array((c["s1_id"].astype(str) + "|" + c["cand_id"].astype(str)).values).sum()))
     old, meta = None, {}
     if cache is not None and cache["path"].exists() and cache["path"].with_suffix(".json").exists():
@@ -843,8 +901,14 @@ def tune_thresholds(ev, dec, thr, fb, ex, mg, rounds=2):
 
 
 def predict_p(bundle, X):
-    """Mean of the fold models, then isotonic calibration."""
+    """Mean of the fold models (stacked with Extra-Trees + logistic regression when the bundle has a
+    kept ensemble), then isotonic calibration."""
     p = np.mean([m.predict_proba(X)[:, 1] for m in bundle["models"]], axis=0)
+    if bundle.get("ensemble"):
+        import ensemble as E
+        srcn = X["srcn"].values if "srcn" in X else np.full(len(X), 2)
+        am = X["a_missing"].fillna(0).values if "a_missing" in X else np.zeros(len(X))
+        p = E.predict_ensemble(bundle["ensemble"], X, p, srcn, am)
     cal = bundle.get("calibrator")
     return cal.predict(p) if cal is not None else p
 
@@ -910,6 +974,8 @@ def cmd_train(a):
     print(f"training rows after easy-negative sampling: {samp.sum():,} of {len(c):,}")
     oof = np.zeros(len(c), np.float32)
     models = []
+    use_ens = os.environ.get("BER_ENSEMBLE", "0") == "1"
+    oof_et, oof_lr, ens_et, ens_lr = np.zeros(len(c)), np.zeros(len(c)), [], []
     for k in range(a.folds):
         te = fold == k
         tr = ~te & samp
@@ -918,6 +984,39 @@ def cmd_train(a):
         models.append(m)
         print(f"  fold {k}: train {tr.sum():,} / held-out {te.sum():,}  "
               f"trees {getattr(m, 'best_iteration_', None)}  ({time.time() - t0:.0f}s)")
+        if use_ens:
+            import ensemble as E
+            Xtr = X[tr].reset_index(drop=True)
+            imp = m.booster_.feature_importance("gain") if hasattr(m, "booster_") else np.ones(X.shape[1])
+            et = E.fit_extra_trees(Xtr, y[tr], wts[tr], imp, seed=k)
+            lr = E.fit_logreg(Xtr, y[tr], wts[tr], seed=k)
+            oof_et[te], oof_lr[te] = E.predict_extra_trees(et, X[te]), E.predict_logreg(lr, X[te])
+            ens_et.append(et); ens_lr.append(lr)
+            print(f"  fold {k}: extra-trees + logistic regression ({time.time() - t0:.0f}s)")
+    ensemble = None
+    if use_ens:
+        # gate: stacked ensemble must beat LightGBM alone on out-of-fold macro F0.5 (same simple rule for both)
+        import ensemble as E
+        am0 = (X["a_missing"].fillna(0).values > 0).astype(int)
+        Z = E.stack_matrix(oof, oof_et, oof_lr, c["srcn"].values, am0)
+        oof_stack = E.stacked_oof(Z, y, fold)
+        n_true0 = load_gt_counts(procs, a.id_col)
+        ev0 = MacroF05(c["s1_id"].values, y, n_true0.to_dict())
+        d0 = c.assign(a_missing=am0)
+
+        def quick(pp):
+            cal0 = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(pp, y)
+            q = cal0.predict(pp)
+            t0_ = {s_: best_threshold(y[c["srcn"].values == s_], q[c["srcn"].values == s_]) for s_ in (2, 3)}
+            return ev0(decide(d0, q, t0_, False, False, 0.05))["e2e"]
+        m_lgb, m_stack = quick(oof), quick(oof_stack)
+        print(f"ensemble gate: LightGBM alone {m_lgb:.4f} | stacked LGB+ET+LR {m_stack:.4f} (out-of-fold macro F0.5)")
+        if m_stack > m_lgb + 0.0005:
+            ensemble = {"et": ens_et, "lr": ens_lr, "stacker": E.fit_stacker(Z, y)}
+            oof = oof_stack.astype(np.float32)
+            print("ensemble KEPT")
+        else:
+            print("ensemble NOT kept (no out-of-fold gain)")
     cal = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(oof, y)
     pc = cal.predict(oof)
     from sklearn.metrics import average_precision_score, brier_score_loss
@@ -984,7 +1083,7 @@ def cmd_train(a):
         print("top features:", ", ".join(f"{k}({v})" for k, v in top))
     os.makedirs(C.RUN_MODELS_DIR, exist_ok=True)
     out = os.path.join(C.RUN_MODELS_DIR, "stage4_model.joblib")
-    joblib.dump({"models": models, "calibrator": cal, "feats": list(X.columns), "thr": thr,
+    joblib.dump({"models": models, "calibrator": cal, "feats": list(X.columns), "thr": thr, "ensemble": ensemble,
                  "fallback": best[1], "exclusive": best[2], "margin": best[3]}, out)
     print("saved", out)
 
@@ -1129,6 +1228,40 @@ def cmd_evaluate(a):
         permutation_report(bundle, c, X[cols], y, s1_all, n_true)
 
 
+def loss_decomposition(g, c, s1_all):
+    """Macro F0.5 lost to each cause: the score if ONLY that loss were fixed, minus the actual score.
+    g: every true pair of the population with its outcome; c: scored candidates with keep / is_true."""
+    b2 = 0.25
+    pop = pd.Index(pd.unique(s1_all.astype(str)))
+    true_n = g.groupby("s1_id").size().reindex(pop).fillna(0)
+    oc = g.groupby(["s1_id", "outcome"]).size().unstack(fill_value=0).reindex(pop).fillna(0)
+    for col in ("TP", "missed_by_blocking", "removed_by_pruning", "rejected_by_model"):
+        if col not in oc:
+            oc[col] = 0
+    fp = c[c["keep"] & ~c["is_true"]].groupby("s1_id").size().reindex(pop).fillna(0)
+
+    def macro(tp, fpn):
+        pred = tp + fpn
+        f = np.where((pred == 0) & (true_n == 0), 1.0,
+                     np.where(pred == 0, 0.0, (1 + b2) * tp / np.maximum((1 + b2) * tp + b2 * (true_n - tp) + fpn, 1e-9)))
+        return float(np.mean(f))
+    base = macro(oc["TP"], fp)
+    rows = [("actual", base, 0.0)]
+    for name, add in (("fix blocking misses", oc["missed_by_blocking"]), ("fix pruning losses", oc["removed_by_pruning"]),
+                      ("fix model rejections", oc["rejected_by_model"])):
+        m = macro(oc["TP"] + add, fp); rows.append((name, m, m - base))
+    m = macro(oc["TP"], fp * 0); rows.append(("remove all false positives", m, m - base))
+    single_fp = int(((true_n == 0) & (fp > 0)).sum())
+    m = macro(oc["TP"], fp.where(true_n > 0, 0)); rows.append(("empty prediction for singletons", m, m - base))
+    m = macro(true_n, fp * 0); rows.append(("perfect", m, m - base))
+    print("\nloss decomposition (macro F0.5 if only that loss were fixed)")
+    for name, m, d in rows:
+        print(f"  {name:34} {m:.4f}  (+{d:.4f})")
+    print(f"  singletons wrongly given a match: {single_fp:,} of {int((true_n == 0).sum()):,}")
+    lp = C.PROCESSED_DIR / "lost_pairs_classified.parquet"
+    pd.DataFrame(rows, columns=["scenario", "macro_f05", "gain"]).to_csv(C.PROCESSED_DIR / "eval_loss_decomposition.csv", index=False)
+
+
 def breakdown_report(a, c, X, p, keep, y, s1_all, procs, tabs):
     """Pair-level confusion matrix per target source x address present/missing, where every
     ground-truth pair of the held-out S1 population ends in exactly one bucket: missed by blocking,
@@ -1177,6 +1310,7 @@ def breakdown_report(a, c, X, p, keep, y, s1_all, procs, tabs):
     if not a.blocked_dir:
         g.loc[g["outcome"] == "removed_by_pruning", "outcome"] = "missed_by_blocking"
     g.to_parquet(C.PROCESSED_DIR / "eval_gt_outcomes.parquet", index=False)
+    loss_decomposition(g, c, s1_all)
     thr = load_bundle()["thr"]
     rows = []
     for s_ in (2, 3, None):

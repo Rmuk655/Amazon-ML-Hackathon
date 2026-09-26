@@ -134,10 +134,24 @@ def cmd_fit(a):
         oof[fold == k] = mk().fit(X[fold != k], y[fold != k]).predict_proba(X[fold == k])[:, 1]
     # highest threshold that keeps PRUNE_RECALL of the true pairs blocking found
     ps = np.sort(oof[y == 1])
-    thr = float(ps[int(np.floor((1 - C.PRUNE_RECALL) * len(ps)))]) if len(ps) else 0.0
-    thr = min(thr, C.PRUNE_MAX_THR)
-    keep = oof >= thr
+    thr_recall = float(ps[int(np.floor((1 - C.PRUNE_RECALL) * len(ps)))]) if len(ps) else 0.0
     n_s1 = d["s1_id"].nunique()
+    # candidate budget (smaller candidate sets count in the ranking): lowest threshold giving <= budget per S1
+    budget = float(os.environ.get("BER_PRUNE_MAX_CANDS", "5"))
+    srt = np.sort(oof)[::-1]
+    thr_budget = float(srt[min(int(budget * n_s1), len(srt) - 1)])
+    rec_budget = float((oof[y == 1] >= thr_budget).mean()) if len(ps) else 1.0
+    if thr_budget <= thr_recall:
+        thr = min(thr_recall, max(C.PRUNE_MAX_THR, thr_budget))       # both targets met
+    elif rec_budget >= C.PRUNE_RECALL - 0.0005:
+        thr = thr_budget
+    else:
+        thr = min(thr_recall, C.PRUNE_MAX_THR)
+        print(f"[prune fit] WARNING: <= {budget:g} candidates/S1 would keep only {rec_budget:.4f} of found true "
+              f"pairs (< {C.PRUNE_RECALL}); keeping the recall target (threshold {thr:.4f})")
+    print(f"[prune fit] recall-target threshold {thr_recall:.4f} | budget threshold {thr_budget:.4f} "
+          f"(keeps {rec_budget:.4f}) -> using {thr:.4f}")
+    keep = oof >= thr
     print(f"[prune fit] threshold {thr:.4f}: {len(d) / n_s1:.1f} -> {keep.sum() / n_s1:.1f} candidates per S1, "
           f"true pairs kept {y[keep].sum() / y.sum():.4f} (OOF)")
     bundle = {"model": mk().fit(X, y), "feats": feats, "thr": thr}
