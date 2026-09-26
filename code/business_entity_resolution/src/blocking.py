@@ -83,17 +83,18 @@ def record_keys(name: str, addr: str):
     out.append((KT["pre"], "F|" + "|".join(w[:4] for w in t[:2])))
     for i in range(min(len(t) - 1, 3)):
         out.append((KT["join"], "J|" + t[i] + t[i + 1]))
-    for i in range(min(len(t) - 2, 2)):                    # 3-word glue (generator glues 2-3 words)
-        out.append((KT["join"], "J|" + t[i] + t[i + 1] + t[i + 2]))
-    if 2 <= len(t) <= 5:
-        out.append((KT["join"], "J|" + "".join(t)))        # whole name glued ('agroshreedevelopers')
+    if C.NEW_KEYS:
+        for i in range(min(len(t) - 2, 2)):                # 3-word glue (generator glues 2-3 words)
+            out.append((KT["join"], "J|" + t[i] + t[i + 1] + t[i + 2]))
+        if 2 <= len(t) <= 5:
+            out.append((KT["join"], "J|" + "".join(t)))    # whole name glued ('agroshreedevelopers')
     for w in t:
         if len(w) >= 8:
             out.append((KT["join"], "J|" + w))
-    if len(t) >= 2:                                        # word order invariant (reordered names)
+    if C.NEW_KEYS and len(t) >= 2:                         # word order invariant (reordered names)
         out.append((KT["sorted"], "S|" + " ".join(sorted(set(t)))))
         out.append((KT["acro"], "I|" + "".join(w[0] for w in t)))   # acronym side: initials of the name
-    elif 2 <= len(t[0]) <= 5 and t[0].isalpha():
+    elif C.NEW_KEYS and 2 <= len(t[0]) <= 5 and t[0].isalpha():
         out.append((KT["acro"], "I|" + t[0]))              # a short one-word name may be an acronym
     if addr:
         a = addr.split()
@@ -108,7 +109,7 @@ def record_keys(name: str, addr: str):
         # replaced entirely ('rose infocom partners' -> 'fayelum') when the address parts are reordered
         house = next((w for w in a if w[:1].isdigit() and len(w) <= 6), None)
         street = next((w for w in a if w.isalpha() and len(w) >= 4 and w not in _STREET_WORDS), None)
-        if house and street:
+        if C.ADDR_KEY and house and street:
             out.append((KT["addrbi"], f"H|{house}|{street}"))
     return out
 

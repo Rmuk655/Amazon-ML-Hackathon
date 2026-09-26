@@ -21,7 +21,7 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 CODE = os.path.join(ROOT, "code", "business_entity_resolution")
-SKIP_FILES = {"profile_data.py", "analyze_failures.py", "analyze_missed.py"}   # analysis-only, not part of the submission
+SKIP_FILES = {"profile_data.py", "analyze_failures.py", "analyze_missed.py", "analyze_denoise.py"}   # analysis-only, not part of the submission
 SKIP_DIRS = {"__pycache__", ".ipynb_checkpoints", ".git", "venv", ".venv", "logs"}
 SKIP_EXT = {".pyc", ".parquet", ".joblib", ".bin", ".zip", ".pkl"}
 MAX_CODE_FILE_MB = 5
