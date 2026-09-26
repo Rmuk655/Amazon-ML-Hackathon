@@ -127,8 +127,10 @@ def cmd_fit(a):
     ids, sample = set(), []
     for f in files:                                     # sample per file: never hold every candidate at once
         x = pd.read_parquet(f)
-        x = x[~C.is_holdout(x["s1_id"].values)]          # locked holdout never trains the pruner
+        # text for EVERY record (the fitted pruner is applied to all train candidates, holdout included);
+        # only the training sample excludes the locked holdout
         ids.update(x["s1_id"].astype(str)); ids.update(x["cand_id"].astype(str))
+        x = x[~C.is_holdout(x["s1_id"].values)]          # locked holdout never trains the pruner
         if frac < 1.0:
             x = x[pd.util.hash_array(x["s1_id"].values) % 10_000 < int(frac * 10_000)]
         sample.append(x)
