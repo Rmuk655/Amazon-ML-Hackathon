@@ -81,10 +81,22 @@ def apply_split(split, bundle, text=None, write_tsv=False):
             ids.update(x["s1_id"].astype(str)); ids.update(x["cand_id"].astype(str))
         text = load_text(split, ids)
     before = after = tp_before = tp_after = 0
+    thr_split = bundle["thr"]
+    budget = os.environ.get("BER_PRUNE_SPLIT_BUDGET")          # optional: hold THIS split to <= budget candidates/S1
+    if budget:
+        ps = []
+        for f in files:
+            d0 = cheap_feats(pd.read_parquet(f), text)
+            ps.append(bundle["model"].predict_proba(X_of(d0, bundle["feats"]))[:, 1])
+        ps = np.sort(np.concatenate(ps))[::-1]
+        n_s1_split = len(pd.read_parquet(C.PROCESSED_DIR / f"blocked_s1_{split}.parquet"))
+        k = min(int(float(budget) * n_s1_split), len(ps) - 1)
+        thr_split = max(thr_split, float(ps[k]))
+        print(f"[prune {split}] candidate budget {budget}/S1 -> threshold {thr_split:.4f} (fit threshold {bundle['thr']:.4f})")
     for f in files:
         d = cheap_feats(pd.read_parquet(f), text)
         p = bundle["model"].predict_proba(X_of(d, bundle["feats"]))[:, 1]
-        keep = p >= bundle["thr"]
+        keep = p >= thr_split
         before, after = before + len(d), after + int(keep.sum())
         if "is_true" in d:
             tp_before += int(d["is_true"].sum())

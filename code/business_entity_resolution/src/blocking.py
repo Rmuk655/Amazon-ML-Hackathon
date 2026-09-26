@@ -83,9 +83,18 @@ def record_keys(name: str, addr: str):
     out.append((KT["pre"], "F|" + "|".join(w[:4] for w in t[:2])))
     for i in range(min(len(t) - 1, 3)):
         out.append((KT["join"], "J|" + t[i] + t[i + 1]))
+    for i in range(min(len(t) - 2, 2)):                    # 3-word glue (generator glues 2-3 words)
+        out.append((KT["join"], "J|" + t[i] + t[i + 1] + t[i + 2]))
+    if 2 <= len(t) <= 5:
+        out.append((KT["join"], "J|" + "".join(t)))        # whole name glued ('agroshreedevelopers')
     for w in t:
         if len(w) >= 8:
             out.append((KT["join"], "J|" + w))
+    if len(t) >= 2:                                        # word order invariant (reordered names)
+        out.append((KT["sorted"], "S|" + " ".join(sorted(set(t)))))
+        out.append((KT["acro"], "I|" + "".join(w[0] for w in t)))   # acronym side: initials of the name
+    elif 2 <= len(t[0]) <= 5 and t[0].isalpha():
+        out.append((KT["acro"], "I|" + t[0]))              # a short one-word name may be an acronym
     if addr:
         a = addr.split()
         for pc in [w for w in a if w.isdigit() and 5 <= len(w) <= 6][:2]:
@@ -395,7 +404,13 @@ def run(args):
                     st.pre_trunc[s] += int(((cand.is_true) & (cand.src == s)).sum())
             # reverse top-K_REV: this target's best S1 entities in this chunk (a superset of its global top)
             cand["t_rank"] = (cand.groupby("t")["score"].rank(method="first", ascending=False) - 1).to_numpy(np.int16)
-            cand = cand[(cand["rank"] < args.k) | (cand["tf_rank"] < C.TFIDF_K) | (cand["t_rank"] < C.K_REV)]
+            keep = (cand["rank"] < args.k) | (cand["tf_rank"] < C.TFIDF_K) | (cand["t_rank"] < C.K_REV)
+            if C.BYPASS_KEYS:                                # exact core name + an address key: never cut
+                mk = cand["mask"].to_numpy().astype(np.int64)
+                core_hit = (mk >> KT["core"]) & 1 == 1
+                addr_hit = ((mk >> KT["nameaddr"]) & 1 == 1) | ((mk >> KT["addrbi"]) & 1 == 1)
+                keep |= core_hit & addr_hit
+            cand = cand[keep]
             cand = cand.reset_index(drop=True)
             if A is not None:
                 cand["tf_cos"] = tfc.cos(A, cand["s"].to_numpy() - a, cand["t"].to_numpy())
