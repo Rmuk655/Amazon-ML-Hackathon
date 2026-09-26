@@ -19,3 +19,5 @@ dataset/processed/eda/
 dataset/dev/
 models/dev/
 remote_pull/
+submissions/
+kaggle_out/

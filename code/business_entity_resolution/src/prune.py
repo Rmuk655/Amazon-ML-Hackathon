@@ -26,7 +26,7 @@ import config as C
 from matching import addr_parts
 
 BLOCK_FEATS = ["src", "score", "mask", "rank", "tf_cos", "tf_rank", "fwd_n", "fwd_margin", "rev_rank",
-               "rev_n", "rev_margin"]
+               "rev_n", "rev_margin", "emb_cos"]
 CHEAP_FEATS = ["c_name", "c_addr", "c_house"]
 MODEL = os.path.join(C.RUN_MODELS_DIR, "pruner.joblib")
 FIT_MAX_PAIRS = int(os.environ.get("BER_PRUNE_FIT_PAIRS", "6000000"))   # training sample (hash-sampled by S1 entity)
