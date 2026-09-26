@@ -957,13 +957,20 @@ def cmd_train(a):
         raise SystemExit("Train candidates lack is_true; run blocking.py --split train --eval")
     ho = C.is_holdout(c["s1_id"].values)
     print(f"locked holdout: {ho.sum():,} candidate rows of {c.loc[ho, 's1_id'].nunique():,} S1 excluded from training/tuning")
+    use_ens = os.environ.get("BER_ENSEMBLE", "0") == "1"
+    ch = c[ho].reset_index(drop=True) if use_ens else None     # scored only for the ensemble gate
     c = c[~ho].reset_index(drop=True)
     y = c["is_true"].astype(bool).values
     print(f"train candidates: {len(c):,}, positives: {y.sum():,} ({y.mean():.3%})")
     procs = find_processed("train", parse_procs(a.proc_file))
     need = set(c["s1_id"]) | set(c["cand_id"])
     tabs = load_tables(procs, need, a.id_col)
+    if ch is not None:
+        need |= set(ch["s1_id"]) | set(ch["cand_id"])
+        tabs = load_tables(procs, need, a.id_col)
     X = compute_features(c, tabs, a.workers, feature_cache("train", f"train_frac{a.s1_frac}", files, procs))
+    Xh = compute_features(ch, tabs, a.workers, feature_cache("train", f"holdout_frac{a.s1_frac}", files, procs)) \
+        if ch is not None and len(ch) else None
     print(f"features done in {time.time() - t0:.0f}s")
     ok = ~X[FEATS].isna().all(axis=1).values
     c, X, y = c[ok].reset_index(drop=True), X[ok].reset_index(drop=True), y[ok]
@@ -977,7 +984,6 @@ def cmd_train(a):
     print(f"training rows after easy-negative sampling: {samp.sum():,} of {len(c):,}")
     oof = np.zeros(len(c), np.float32)
     models = []
-    use_ens = os.environ.get("BER_ENSEMBLE", "0") == "1"
     oof_et, oof_lr, ens_et, ens_lr = np.zeros(len(c)), np.zeros(len(c)), [], []
     for k in range(a.folds):
         te = fold == k
@@ -998,28 +1004,44 @@ def cmd_train(a):
             print(f"  fold {k}: extra-trees + logistic regression ({time.time() - t0:.0f}s)")
     ensemble = None
     if use_ens:
-        # gate: stacked ensemble must beat LightGBM alone on out-of-fold macro F0.5 (same simple rule for both)
+        # gate on the LOCKED HOLDOUT (never trained on): stacked ensemble must beat LightGBM alone in macro F0.5;
+        # calibration and per-source thresholds for both come from the out-of-fold predictions
         import ensemble as E
         am0 = (X["a_missing"].fillna(0).values > 0).astype(int)
         Z = E.stack_matrix(oof, oof_et, oof_lr, c["srcn"].values, am0)
         oof_stack = E.stacked_oof(Z, y, fold)
-        n_true0 = load_gt_counts(procs, a.id_col)
-        ev0 = MacroF05(c["s1_id"].values, y, n_true0.to_dict())
-        d0 = c.assign(a_missing=am0)
+        stacker = E.fit_stacker(Z, y)
+        ensemble_cand = {"et": ens_et, "lr": ens_lr, "stacker": stacker}
+        kept = False
+        if Xh is not None:
+            cols_h = list(X.columns)
+            for col in cols_h:
+                if col not in Xh:
+                    Xh[col] = np.nan
+            Xh = Xh[cols_h]
+            yh = ch["is_true"].astype(bool).values
+            amh = (Xh["a_missing"].fillna(0).values > 0).astype(int)
+            ph_lgb = np.mean([m_.predict_proba(Xh)[:, 1] for m_ in models], axis=0)
+            ph_stack = E.predict_ensemble(ensemble_cand, Xh, ph_lgb, ch["srcn"].values, amh)
+            n_true0 = load_gt_counts(procs, a.id_col)
+            evh = MacroF05(ch["s1_id"].values, yh, n_true0.to_dict())
+            dh = ch.assign(a_missing=amh)
 
-        def quick(pp):
-            cal0 = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(pp, y)
-            q = cal0.predict(pp)
-            t0_ = {s_: best_threshold(y[c["srcn"].values == s_], q[c["srcn"].values == s_]) for s_ in (2, 3)}
-            return ev0(decide(d0, q, t0_, False, False, 0.05))["e2e"]
-        m_lgb, m_stack = quick(oof), quick(oof_stack)
-        print(f"ensemble gate: LightGBM alone {m_lgb:.4f} | stacked LGB+ET+LR {m_stack:.4f} (out-of-fold macro F0.5)")
-        if m_stack > m_lgb + 0.0005:
-            ensemble = {"et": ens_et, "lr": ens_lr, "stacker": E.fit_stacker(Z, y)}
+            def holdout_macro(p_oof, p_h):
+                cal0 = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(p_oof, y)
+                q, qh = cal0.predict(p_oof), cal0.predict(p_h)
+                t_ = {s_: best_threshold(y[c["srcn"].values == s_], q[c["srcn"].values == s_]) for s_ in (2, 3)}
+                return evh(decide(dh, qh, t_, False, False, 0.05))["e2e"]
+            m_lgb, m_stack = holdout_macro(oof, ph_lgb), holdout_macro(oof_stack, ph_stack)
+            print(f"ensemble gate (LOCKED HOLDOUT, {ch['s1_id'].nunique():,} S1): LightGBM alone {m_lgb:.4f} | "
+                  f"stacked LGB + Extra-Trees + RBF {m_stack:.4f}")
+            kept = m_stack > m_lgb + 0.0005
+        if kept:
+            ensemble = ensemble_cand
             oof = oof_stack.astype(np.float32)
             print("ensemble KEPT")
         else:
-            print("ensemble NOT kept (no out-of-fold gain)")
+            print("ensemble NOT kept (no locked-holdout gain)")
     cal = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(oof, y)
     pc = cal.predict(oof)
     from sklearn.metrics import average_precision_score, brier_score_loss
