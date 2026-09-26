@@ -60,6 +60,11 @@ def skel(tok: str) -> str:
     return s or tok
 
 
+_STREET_WORDS = {"road", "street", "lane", "avenue", "nagar", "floor", "building", "near", "opposite", "sector",
+                 "plot", "flat", "house", "shop", "office", "block", "phase", "main", "cross", "colony", "drive",
+                 "court", "place", "suite", "apartment", "complex", "tower", "rue", "boulevard", "chemin", "allée"}
+
+
 def record_keys(name: str, addr: str):
     out = []
     t = name.split() if name else []
@@ -90,6 +95,12 @@ def record_keys(name: str, addr: str):
             out.append((KT["nameaddr"], f"N|{sk[0]}|{w}"))
         for i in range(min(len(a) - 1, 2)):
             out.append((KT["addrbi"], f"B|{a[i]}|{a[i + 1]}"))
+        # address-only key (house number + first street word, any order): finds records whose name was
+        # replaced entirely ('rose infocom partners' -> 'fayelum') when the address parts are reordered
+        house = next((w for w in a if w[:1].isdigit() and len(w) <= 6), None)
+        street = next((w for w in a if w.isalpha() and len(w) >= 4 and w not in _STREET_WORDS), None)
+        if house and street:
+            out.append((KT["addrbi"], f"H|{house}|{street}"))
     return out
 
 

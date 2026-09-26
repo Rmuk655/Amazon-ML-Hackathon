@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 import config as C
 from canonical import name_keys
+from name_clean import NameCleaner
 from lang_id import NativeLID
 from text_utils import (INDIC_RE, OcrFixer, dominant_indic_script, fold_latin, indic_part, normalize,
                         normalize_address, normalize_name, scripts_present, split_scripts, tokenize)
@@ -134,6 +135,10 @@ def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
     if OCR is not None:                               # '5ervices' -> 'services' before canonical keys
         u = df["business_name_rom"].unique()
         df["business_name_rom"] = df["business_name_rom"].map(dict(zip(u, map(OCR, u))))
+        if os.environ.get("BER_NAME_CLEAN", "1") != "0":  # aliases, website forms, titles, glued words
+            cleaner = NameCleaner(OCR.vocab)
+            u = df["business_name_rom"].unique()
+            df["business_name_rom"] = df["business_name_rom"].map(dict(zip(u, map(cleaner, u))))
     rn = df["business_name_rom"]
     keys = {s: name_keys(s) for s in rn.unique()}
     for i, k in enumerate(("c4a", "c4b", "legal")):
