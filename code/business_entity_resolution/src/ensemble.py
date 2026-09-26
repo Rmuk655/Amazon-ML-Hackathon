@@ -1,5 +1,6 @@
 """Heterogeneous ensemble for the matcher: LightGBM (existing) + importance-weighted Extra-Trees +
-logistic regression, combined by a stacked logistic regression. Enabled with BER_ENSEMBLE=1 and kept
+an approximate-RBF kernel model (Nystroem + linear), combined by a stacked logistic regression (the only
+place logistic regression is used). Enabled with BER_ENSEMBLE=1 and kept
 only if it beats LightGBM alone on out-of-fold macro F0.5 (gate in matching.cmd_train).
 
 Extra-Trees here is a random-subspace ensemble: each member sees a random NUMBER of features, drawn with
@@ -47,26 +48,39 @@ def predict_extra_trees(members, X):
     return p / max(len(members), 1)
 
 
-def fit_logreg(X, y, w, seed=0):
-    from sklearn.linear_model import LogisticRegression
+def fit_rbf(X, y, w, seed=0, rows=300_000, components=400):
+    """Approximate-RBF kernel model: impute + scale -> Nystroem RBF features -> linear classifier.
+    Smooth, distance-based decision surface: errors unlike both boosting and randomized trees."""
+    from sklearn.kernel_approximation import Nystroem
+    from sklearn.linear_model import SGDClassifier
     from sklearn.preprocessing import StandardScaler
     rng = np.random.default_rng(seed)
-    rows = rng.choice(len(X), size=min(LR_ROWS, len(X)), replace=False)
-    Xa = X.iloc[rows]
+    idx = rng.choice(len(X), size=min(rows, len(X)), replace=False)
+    Xa = X.iloc[idx]
     miss = Xa.isna().to_numpy(np.float32)
-    keep_miss = miss.mean(axis=0) > 0.001                   # missing-value indicators that carry signal
+    keep_miss = miss.mean(axis=0) > 0.001
     Z = np.hstack([np.nan_to_num(Xa.to_numpy(np.float64)), miss[:, keep_miss]])
     sc = StandardScaler().fit(Z)
-    m = LogisticRegression(C=1.0, max_iter=300).fit(sc.transform(Z), y[rows],
-                                                    sample_weight=None if w is None else w[rows])
-    return {"scaler": sc, "model": m, "keep_miss": keep_miss, "cols": list(X.columns)}
+    Zs = np.clip(sc.transform(Z), -6, 6)
+    ny = Nystroem(kernel="rbf", gamma=1.0 / Zs.shape[1], n_components=min(components, len(Zs)), random_state=seed).fit(Zs)
+    clf = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=30, tol=1e-4, random_state=seed)
+    clf.fit(ny.transform(Zs), y[idx], sample_weight=None if w is None else w[idx])
+    return {"scaler": sc, "nystroem": ny, "model": clf, "keep_miss": keep_miss, "cols": list(X.columns)}
 
 
-def predict_logreg(lr, X):
-    X = X[lr["cols"]]
-    miss = X.isna().to_numpy(np.float32)
-    Z = np.hstack([np.nan_to_num(X.to_numpy(np.float64)), miss[:, lr["keep_miss"]]])
-    return lr["model"].predict_proba(lr["scaler"].transform(Z))[:, 1]
+def predict_rbf(m, X, chunk=500_000):
+    X = X[m["cols"]]
+    out = np.zeros(len(X))
+    for i in range(0, len(X), chunk):
+        Xc = X.iloc[i:i + chunk]
+        miss = Xc.isna().to_numpy(np.float32)
+        Z = np.hstack([np.nan_to_num(Xc.to_numpy(np.float64)), miss[:, m["keep_miss"]]])
+        out[i:i + chunk] = m["model"].predict_proba(m["nystroem"].transform(np.clip(m["scaler"].transform(Z), -6, 6)))[:, 1]
+    return out
+
+
+# kept names used by matching.py: the third base model is now the approximate-RBF model
+fit_logreg, predict_logreg = fit_rbf, predict_rbf
 
 
 def _logit(p):
@@ -95,5 +109,5 @@ def stacked_oof(Z, y, fold):
 
 def predict_ensemble(ens, X, p_lgb, srcn, a_missing):
     p_et = np.mean([predict_extra_trees(m, X) for m in ens["et"]], axis=0)
-    p_lr = np.mean([predict_logreg(m, X) for m in ens["lr"]], axis=0)
+    p_lr = np.mean([predict_rbf(m, X) for m in ens["lr"]], axis=0)
     return ens["stacker"].predict_proba(stack_matrix(p_lgb, p_et, p_lr, srcn, a_missing))[:, 1]
