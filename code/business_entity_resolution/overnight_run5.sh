@@ -11,9 +11,9 @@ source ~/run5_urls.env                                   # URL_<name>=presigned 
 log() { echo "[$(date +%T)] $*" | tee -a $S; }
 up() { [ -f "$1" ] && log "upload $(basename $1): $(curl -s -o /dev/null -w '%{http_code}' -T "$1" "$2")"; }
 backup() {  # small artifacts + logs after every stage
-  cd $B && tar -czf ~/run5_logs.tgz code/business_entity_resolution/logs models/*.joblib \
+  (cd $B && tar -czf ~/run5_logs.tgz code/business_entity_resolution/logs models/*.joblib \
      $(ls dataset/processed/eval_*.parquet dataset/processed/eval_loss_decomposition.csv dataset/processed/oof_train.parquet \
-          dataset/processed/decision_trace_test.parquet 2>/dev/null) 2>/dev/null
+          dataset/processed/decision_trace_test.parquet 2>/dev/null) 2>/dev/null)
   up ~/run5_logs.tgz "$URL_logs"
 }
 finish() { log "FINISHED: $1"; backup; sleep 300; sudo shutdown -h now; exit 0; }
