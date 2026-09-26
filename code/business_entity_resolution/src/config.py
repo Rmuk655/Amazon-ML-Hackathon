@@ -63,10 +63,15 @@ def processed_path(split: str, n: int) -> Path:
 
 
 # ---- Stage 3: blocking ----
-KTYPES = ("core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf")
+# new key types are appended AFTER tfidf so the existing mask bits keep their meaning
+KTYPES = ("core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf", "sorted", "acro")
 # A key shared by more targets than its cap is too common to be discriminative -> ignored.
 BLOCK_CAPS = {"core": 300, "tok": 100, "skelbi": 100, "pre": 100, "addrpc": 100,
-              "nameaddr": 100, "addrbi": 50, "join": 100, "tfidf": 0}   # tfidf: not a key (mask bit only)
+              "nameaddr": 100, "addrbi": 50, "join": 100, "tfidf": 0,   # tfidf: not a key (mask bit only)
+              "sorted": 300, "acro": 100}
+# pairs sharing the exact core name AND an address key skip the top-K cut (identical chain names otherwise
+# crowd each other out of the K slots; the analysis found ~13k India true pairs lost that way)
+BYPASS_KEYS = os.environ.get("BER_BYPASS", "1") != "0"
 # char n-gram TF-IDF channel on core names (second, similarity-based blocking channel)
 TFIDF_K = 5                # extra candidates per S1 per source by cosine (0 disables the channel)
 TFIDF_NGRAM = (3, 4)       # char_wb n-gram range

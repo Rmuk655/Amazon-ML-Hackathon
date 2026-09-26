@@ -525,10 +525,11 @@ def extra_features(c, tabs, ia, workers):
 # Feature store: each group's columns are cached per candidate file and reused while the group's
 # code version and its inputs (candidate file + processed tables) are unchanged. Bump a group's
 # version when its code changes; a new group is computed alone and appended to the cache.
-FEATURE_GROUPS = {"base": 1, "amb": 1, "extra": 2, "decoy": 1}
+FEATURE_GROUPS = {"base": 1, "amb": 1, "extra": 2, "decoy": 2}
 DECOY = os.environ.get("BER_DECOY_FEATS", "1") != "0"
 DECOY_FEATS = ["d_house_delta", "d_house_off_small", "d_num_mismatch", "d_one_word_swap", "d_swap_real_words",
-               "d_legal_conflict", "d_extra_word", "d_missing_word", "d_core_tok_diff"]
+               "d_legal_conflict", "d_extra_word", "d_missing_word", "d_core_tok_diff", "d_legal_added",
+               "d_legal_dropped"]
 _HN = re.compile(r"\d+(?:[/-]\d+)*[a-z]?")
 _LEGAL_CANON = {"pvt": "private", "ltd": "limited", "co": "company", "corp": "corporation", "inc": "incorporated"}
 
@@ -546,7 +547,7 @@ def decoy_pair(core1, core2, legal1, legal2, addr1, addr2, vocab):
     """Signals of the decoy generator (a decoy is an S1 record with ONE detail changed): house number off by a
     small amount, numbers disagreeing, exactly one real word swapped for another real word, legal form changed,
     one word added / dropped."""
-    out = [np.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    out = [np.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     h1, h2 = _HN.findall(addr1), _HN.findall(addr2)
     if h1 and h2:
         a_, b_ = re.findall(r"\d+", h1[0]), re.findall(r"\d+", h2[0])
@@ -569,6 +570,8 @@ def decoy_pair(core1, core2, legal1, legal2, addr1, addr2, vocab):
     out[6] = float(len(t2) == len(t1) + 1 and s1 <= s2)
     out[7] = float(len(t1) == len(t2) + 1 and s2 <= s1)
     out[8] = float(abs(len(t1) - len(t2)))
+    out[9] = float(not l1 and bool(l2))       # top decoy fingerprint: legal form ADDED (+ house number changed)
+    out[10] = float(bool(l1) and not l2)
     return out
 
 
@@ -726,7 +729,7 @@ SAVE_FLOOR = 0.05     # predict keeps every test pair scored at least this (for 
 TRACE_COLS = ["n_best", "n_tok_jacc_rom", "n_rom_tset", "a_tok_jacc_rom", "a_rom_tset", "a_num_jacc",
               "a_house_eq", "a_house_conflict", "a_pin_conflict", "amb_s1_core_freq", "blk_prune_p", "blk_mask",
               "blk_rank", "blk_t_rank", "blk_tf_cos", "blk_rev_n", "blk_rev_margin"]
-BLOCK_KEY_NAMES = ["core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf"]
+BLOCK_KEY_NAMES = ["core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf", "sorted", "acro"]
 
 
 def blocking_keys(mask):
