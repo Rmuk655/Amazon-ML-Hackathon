@@ -111,6 +111,16 @@ def record_keys(name: str, addr: str):
         street = next((w for w in a if w.isalpha() and len(w) >= 4 and w not in _STREET_WORDS), None)
         if C.ADDR_KEY and house and street:
             out.append((KT["addrbi"], f"H|{house}|{street}"))
+        # dropped / added words (32% of true pairs differ only that way): every core word and every pair of core
+        # words, anchored by the house number (or first street word), so any surviving subset of the name still meets
+        anchor = house or street
+        if C.SUBSET_KEYS and anchor and t:
+            core_w = [w for w in dict.fromkeys(t) if len(w) >= 3][:5]
+            for w in core_w:
+                out.append((KT["subset"], f"U|{w}|{anchor}"))
+            for i in range(len(core_w)):
+                for j in range(i + 1, len(core_w)):
+                    out.append((KT["subset"], f"U|{core_w[i]}|{core_w[j]}|{anchor}"))
     return out
 
 
