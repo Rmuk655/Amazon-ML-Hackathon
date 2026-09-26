@@ -9,9 +9,9 @@ B=~/ber; C=$B/code/business_entity_resolution; L=$C/logs; mkdir -p $L; S=$L/run5
 log() { echo "[$(date +%T)] $*" | tee -a $S; }
 up() { [ -f "$1" ] && log "upload $(basename $1): $(curl -s -o /dev/null -w '%{http_code}' -T "$1" "$2")"; }
 backup() {
-  cd $B && tar -czf ~/run5p_logs.tgz code/business_entity_resolution/logs models/*.joblib \
+  (cd $B && tar -czf ~/run5p_logs.tgz code/business_entity_resolution/logs models/*.joblib \
     $(ls dataset/processed/eval_*.parquet dataset/processed/eval_*.csv dataset/processed/oof_train.parquet \
-         dataset/processed/lost_pairs_classified.parquet dataset/processed/decision_trace_test.parquet 2>/dev/null) 2>/dev/null
+         dataset/processed/lost_pairs_classified.parquet dataset/processed/decision_trace_test.parquet 2>/dev/null) 2>/dev/null)
   up ~/run5p_logs.tgz "$URL_run5p_logs"
 }
 finish() { log "FINISHED: $1"; backup; sleep 300; sudo shutdown -h now; exit 0; }
