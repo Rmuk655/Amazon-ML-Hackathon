@@ -955,6 +955,9 @@ def cmd_train(a):
     c = pd.concat([read_cand_file(f, a.s1_frac) for f in files], ignore_index=True)
     if "is_true" not in c.columns:
         raise SystemExit("Train candidates lack is_true; run blocking.py --split train --eval")
+    ho = C.is_holdout(c["s1_id"].values)
+    print(f"locked holdout: {ho.sum():,} candidate rows of {c.loc[ho, 's1_id'].nunique():,} S1 excluded from training/tuning")
+    c = c[~ho].reset_index(drop=True)
     y = c["is_true"].astype(bool).values
     print(f"train candidates: {len(c):,}, positives: {y.sum():,} ({y.mean():.3%})")
     procs = find_processed("train", parse_procs(a.proc_file))
@@ -1042,7 +1045,7 @@ def cmd_train(a):
         procs[1], columns=[detect_id(pq.ParquetFile(procs[1]).schema_arrow.names, a.id_col)]).iloc[:, 0]).astype(str)
     if a.s1_frac < 1.0:
         s1_all = s1_all[pd.util.hash_array(s1_all.values) % 10_000 < int(a.s1_frac * 10_000)]
-    s1_all = s1_all[s1_all.isin(n_true.index)]
+    s1_all = s1_all[s1_all.isin(n_true.index) & ~C.is_holdout(s1_all.values)]
     absent = s1_all[~s1_all.isin(set(c["s1_id"]))]
     n_abs_single = int((absent.map(n_true) == 0).sum())
     fpw = decoy_ratio(n_true)
@@ -1200,7 +1203,13 @@ def cmd_evaluate(a):
     cut = int(a.train_frac * 10_000)
     files = cand_files("train")
     c = pd.concat([read_cand_file(f) for f in files], ignore_index=True)
-    c = c[pd.util.hash_array(c["s1_id"].values) % 10_000 >= cut].reset_index(drop=True)
+
+    def in_pop(ids):
+        """held-out: never in the model's training sample; with --population holdout also in the locked holdout"""
+        keep = pd.util.hash_array(pd.Series(ids).astype(str).values) % 10_000 >= cut
+        return keep & C.is_holdout(ids) if a.population == "holdout" else keep
+    c = c[in_pop(c["s1_id"].values)].reset_index(drop=True)
+    print(f"evaluation population: {a.population} (train-frac cut {a.train_frac})")
     tabs = load_tables(procs, set(c["s1_id"]) | set(c["cand_id"]), a.id_col)
     X = compute_features(c, tabs, a.workers, feature_cache("train", f"evaluate_{a.train_frac}", files, procs))
     for col in cols:
@@ -1212,7 +1221,7 @@ def cmd_evaluate(a):
     y = c["is_true"].astype(bool).values
     n_true = load_gt_counts(procs, a.id_col)
     s1_all = pd.read_parquet(C.PROCESSED_DIR / "blocked_s1_train.parquet").iloc[:, 0].astype(str)
-    s1_all = s1_all[(pd.util.hash_array(s1_all.values) % 10_000 >= cut) & s1_all.isin(n_true.index)]
+    s1_all = s1_all[in_pop(s1_all.values) & s1_all.isin(n_true.index)]
     ctry = pd.Series(tabs[1].cols["country_norm"], index=tabs[1].index)
     s1_ctry = pd.read_parquet(procs[1], columns=["entity_id", "country_norm"]).set_index("entity_id")["country_norm"]
     print(f"held-out S1 entities: {len(s1_all):,} | candidate pairs {len(c):,} ({len(c) / max(len(s1_all), 1):.1f} per S1)")
@@ -1427,6 +1436,8 @@ def main():
             p.add_argument("--folds", type=int, default=5, help="grouped CV folds (by S1 entity)")
         elif name == "evaluate":
             p.add_argument("--train-frac", type=float, default=0.5, help="the --s1-frac the saved model was trained with")
+            p.add_argument("--population", choices=["heldout", "holdout"], default="heldout",
+                           help="holdout = the locked 10%% holdout (final reporting); heldout = every untrained S1")
             p.add_argument("--permute", action="store_true", help="also report each feature's effect on P / R / F0.5")
             p.add_argument("--blocked-dir", default=None, help="copy of the candidates before pruning (splits FN into blocking vs pruning)")
         else:
