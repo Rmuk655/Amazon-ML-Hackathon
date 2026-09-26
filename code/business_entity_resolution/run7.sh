@@ -16,7 +16,7 @@ backup() {
   up ~/run7.logs.tgz "$URL_run7_logs"
 }
 finish() { log "FINISHED: $1"; backup; sleep 300; sudo shutdown -h now; exit 0; }
-export MEM_CAP=none PY=../../../venv/bin/python S1_FRAC=0.5 FOLDS=3 BER_K=30 BER_K_REV=3 BER_LR=0.1 \
+export MEM_CAP=none PY=../../../venv/bin/python S1_FRAC=1.0 FOLDS=3 BER_K=30 BER_K_REV=3 BER_LR=0.1 \
        BER_EXTRA_FEATS=1 BER_DECOY_FEATS=1 BER_ENSEMBLE=0 BER_PRUNE_MAX_CANDS=5 BER_PRUNE_SPLIT_BUDGET=5 BER_PRUNE_FIT_PAIRS=3000000 BER_TOKEN_REPAIR=1 FORCE=1
 cd $C/src
 log "smoke test"

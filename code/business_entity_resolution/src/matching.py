@@ -729,7 +729,7 @@ SAVE_FLOOR = 0.05     # predict keeps every test pair scored at least this (for 
 TRACE_COLS = ["n_best", "n_tok_jacc_rom", "n_rom_tset", "a_tok_jacc_rom", "a_rom_tset", "a_num_jacc",
               "a_house_eq", "a_house_conflict", "a_pin_conflict", "amb_s1_core_freq", "blk_prune_p", "blk_mask",
               "blk_rank", "blk_t_rank", "blk_tf_cos", "blk_rev_n", "blk_rev_margin"]
-BLOCK_KEY_NAMES = ["core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf", "sorted", "acro"]
+BLOCK_KEY_NAMES = ["core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf", "sorted", "acro", "subset"]
 
 
 def blocking_keys(mask):

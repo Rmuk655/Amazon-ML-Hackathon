@@ -64,16 +64,17 @@ def processed_path(split: str, n: int) -> Path:
 
 # ---- Stage 3: blocking ----
 # new key types are appended AFTER tfidf so the existing mask bits keep their meaning
-KTYPES = ("core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf", "sorted", "acro")
+KTYPES = ("core", "tok", "skelbi", "pre", "addrpc", "nameaddr", "addrbi", "join", "tfidf", "sorted", "acro", "subset")
 # A key shared by more targets than its cap is too common to be discriminative -> ignored.
 BLOCK_CAPS = {"core": 300, "tok": 100, "skelbi": 100, "pre": 100, "addrpc": 100,
               "nameaddr": 100, "addrbi": 50, "join": 100, "tfidf": 0,   # tfidf: not a key (mask bit only)
-              "sorted": 300, "acro": 100}
+              "sorted": 300, "acro": 100, "subset": 100}
 # pairs sharing the exact core name AND an address key skip the top-K cut (identical chain names otherwise
 # crowd each other out of the K slots; the analysis found ~13k India true pairs lost that way)
 BYPASS_KEYS = os.environ.get("BER_BYPASS", "1") != "0"
 NEW_KEYS = os.environ.get("BER_NEW_KEYS", "1") != "0"      # sorted-token, acronym, 3-word / whole-name glue keys
 ADDR_KEY = os.environ.get("BER_ADDR_KEY", "1") != "0"      # address-only key (house number + street word)
+SUBSET_KEYS = os.environ.get("BER_SUBSET_KEYS", "1") != "0"  # dropped/added words: word pairs / words anchored by address
 # char n-gram TF-IDF channel on core names (second, similarity-based blocking channel)
 TFIDF_K = 5                # extra candidates per S1 per source by cosine (0 disables the channel)
 TFIDF_NGRAM = (3, 4)       # char_wb n-gram range
