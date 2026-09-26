@@ -72,6 +72,8 @@ BLOCK_CAPS = {"core": 300, "tok": 100, "skelbi": 100, "pre": 100, "addrpc": 100,
 # pairs sharing the exact core name AND an address key skip the top-K cut (identical chain names otherwise
 # crowd each other out of the K slots; the analysis found ~13k India true pairs lost that way)
 BYPASS_KEYS = os.environ.get("BER_BYPASS", "1") != "0"
+NEW_KEYS = os.environ.get("BER_NEW_KEYS", "1") != "0"      # sorted-token, acronym, 3-word / whole-name glue keys
+ADDR_KEY = os.environ.get("BER_ADDR_KEY", "1") != "0"      # address-only key (house number + street word)
 # char n-gram TF-IDF channel on core names (second, similarity-based blocking channel)
 TFIDF_K = 5                # extra candidates per S1 per source by cosine (0 disables the channel)
 TFIDF_NGRAM = (3, 4)       # char_wb n-gram range
