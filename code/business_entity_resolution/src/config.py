@@ -39,6 +39,21 @@ BEAM_WIDTH = 4
 CACHE_FLUSH_EVERY = 2000
 
 
+# ---- locked holdout: a fixed 10% of TRAIN S1 entities (and their records) excluded from rule inference,
+# pruner fitting, training and threshold tuning; used only for final reporting. Own hash key, so it is
+# independent of the S1-sample and fold hashes (which use pandas' default key).
+HOLDOUT_FRAC = 0.10
+HOLDOUT_KEY = "lockedholdout001"                      # exactly 16 characters (pandas hash_key)
+
+
+def is_holdout(s1_ids):
+    import numpy as np
+    import pandas as pd
+    ids = pd.Series(s1_ids).astype(str).values
+    return (pd.util.hash_array(ids, hash_key=HOLDOUT_KEY) % 10_000 < int(HOLDOUT_FRAC * 10_000)).astype(bool) \
+        if len(ids) else np.zeros(0, bool)
+
+
 def source_path(split: str, n: int) -> Path:
     return DATASET_DIR / split / f"{split}_source{n}.tsv"
 

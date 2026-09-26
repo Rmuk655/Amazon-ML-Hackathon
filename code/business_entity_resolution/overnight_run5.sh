@@ -49,6 +49,11 @@ for f in $B/dataset/processed/*.parquet $B/dataset/processed/*.tsv; do ln -s "$f
 cp -r $B/dataset/processed/candidates_test $P5A/candidates_test
 ( export BER_PROCESSED_DIR=$P5A BER_MODELS_DIR=$B/models_run3 BER_DECOY_FEATS=0 BER_ENSEMBLE=0
   cd $C/src && $PY -u prune.py apply --split test && $PY -u matching.py predict && $PY -u package_submission.py --out ~/submission5a.zip
+  # locked-holdout evaluation of 5a: run-3 model was trained on hash<0.5 (before the holdout existed), so only
+  # holdout S1s outside that half are clean
+  rm -rf $P5A/candidates_train; cp -r $B/dataset/processed/candidates_train_preprune $P5A/candidates_train
+  $PY -u prune.py apply --split train --no-tsv
+  $PY -u matching.py evaluate --population holdout --train-frac 0.5 --blocked-dir $B/dataset/processed/candidates_train_preprune
 ) > $L/r5_5a.log 2>&1 & P5=$!
 # ---------------------------------------------------------------- 4. new pruner + retrain (all features + ensemble), in parallel with 5a
 ./run_pipeline.sh prune_train >> $S 2>&1 || finish "FAILED prune_train"
@@ -61,7 +66,7 @@ cd $C/src && $PY -u package_submission.py --out ~/submission5b.zip >> $S 2>&1 &&
 grep -aE "per S1" $L/prune_test.log | tail -1 | tee -a $S
 backup
 # ---------------------------------------------------------------- 6. held-out evaluation of 5b (after the deliverables)
-log "evaluate 5b held-out"
-$PY -u matching.py evaluate --train-frac 0.5 --blocked-dir ../../../dataset/processed/candidates_train_preprune > $L/r5_evaluate.log 2>&1
+log "evaluate 5b on the LOCKED HOLDOUT (excluded from rule inference, pruner, training, tuning)"
+$PY -u matching.py evaluate --population holdout --train-frac 0.0 --blocked-dir ../../../dataset/processed/candidates_train_preprune > $L/r5_evaluate.log 2>&1
 $PY -u analyze_missed.py > $L/r5_missed.log 2>&1
 finish "OK"
