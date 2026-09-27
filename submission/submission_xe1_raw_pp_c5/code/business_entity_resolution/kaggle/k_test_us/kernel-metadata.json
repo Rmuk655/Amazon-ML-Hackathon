@@ -1,0 +1,1 @@
+{"id": "rmuk16/ber-emb-test-us", "title": "ber-emb-test-us", "code_file": "emb.py", "language": "python", "kernel_type": "script", "is_private": true, "enable_gpu": true, "enable_internet": true, "dataset_sources": ["rmuk16/ber-texts"], "competition_sources": [], "kernel_sources": []}
