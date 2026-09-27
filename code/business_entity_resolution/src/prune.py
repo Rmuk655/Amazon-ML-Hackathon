@@ -26,10 +26,10 @@ import config as C
 from matching import addr_parts
 
 BLOCK_FEATS = ["src", "score", "mask", "rank", "tf_cos", "tf_rank", "fwd_n", "fwd_margin", "rev_rank",
-               "rev_n", "rev_margin"]
+               "rev_n", "rev_margin", "emb_cos"]
 CHEAP_FEATS = ["c_name", "c_addr", "c_house"]
-MODEL = os.path.join(C.CODE_DIR.parents[1], "models", "pruner.joblib")
-FIT_MAX_PAIRS = 6_000_000      # training sample (hash-sampled by S1 entity)
+MODEL = os.path.join(C.RUN_MODELS_DIR, "pruner.joblib")
+FIT_MAX_PAIRS = int(os.environ.get("BER_PRUNE_FIT_PAIRS", "6000000"))   # training sample (hash-sampled by S1 entity)
 
 
 def parts(split):
@@ -45,19 +45,22 @@ def load_text(split, ids):
         for b in pf.iter_batches(columns=cols, batch_size=1_000_000):
             x = b.to_pandas()
             out.append(x[x["entity_id"].isin(ids)])
-    t = pd.concat(out, ignore_index=True).drop_duplicates("entity_id").set_index("entity_id")
-    return t.fillna("")
+    t = pd.concat(out, ignore_index=True).drop_duplicates("entity_id").set_index("entity_id").fillna("")
+    parts = t["business_address_rom"].map({a: addr_parts(a) for a in t["business_address_rom"].unique()})
+    t["_addr0"] = [x[0] for x in parts]         # parsed once per record, not once per pair
+    t["_house"] = [x[1] for x in parts]
+    return t
 
 
 def cheap_feats(d, text):
-    a, b = text.reindex(d["s1_id"].values), text.reindex(d["cand_id"].values)
-    na, nb = a["business_name_c4b"].fillna("").to_numpy(object), b["business_name_c4b"].fillna("").to_numpy(object)
-    pa = [addr_parts(x) for x in a["business_address_rom"].fillna("")]
-    pb = [addr_parts(x) for x in b["business_address_rom"].fillna("")]
-    d["c_name"] = cpdist(na, nb, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
-    d["c_addr"] = cpdist([x[0] for x in pa], [x[0] for x in pb], scorer=fuzz.token_set_ratio, workers=-1,
+    ia, ib = text.index.get_indexer(d["s1_id"].values), text.index.get_indexer(d["cand_id"].values)
+    col = lambda c, i: np.where(i >= 0, text[c].to_numpy(object)[np.maximum(i, 0)], "")
+    d["c_name"] = cpdist(col("business_name_c4b", ia), col("business_name_c4b", ib), scorer=fuzz.token_set_ratio,
+                         workers=-1, dtype=np.float32) / 100
+    d["c_addr"] = cpdist(col("_addr0", ia), col("_addr0", ib), scorer=fuzz.token_set_ratio, workers=-1,
                          dtype=np.float32) / 100
-    d["c_house"] = np.array([float(bool(x[1]) and x[1] == y[1]) for x, y in zip(pa, pb)], np.float32)
+    ha, hb = col("_house", ia), col("_house", ib)
+    d["c_house"] = ((ha != "") & (ha == hb)).astype(np.float32)
     return d
 
 
@@ -78,10 +81,22 @@ def apply_split(split, bundle, text=None, write_tsv=False):
             ids.update(x["s1_id"].astype(str)); ids.update(x["cand_id"].astype(str))
         text = load_text(split, ids)
     before = after = tp_before = tp_after = 0
+    thr_split = bundle["thr"]
+    budget = os.environ.get("BER_PRUNE_SPLIT_BUDGET")          # optional: hold THIS split to <= budget candidates/S1
+    if budget:
+        ps = []
+        for f in files:
+            d0 = cheap_feats(pd.read_parquet(f), text)
+            ps.append(bundle["model"].predict_proba(X_of(d0, bundle["feats"]))[:, 1])
+        ps = np.sort(np.concatenate(ps))[::-1]
+        n_s1_split = len(pd.read_parquet(C.PROCESSED_DIR / f"blocked_s1_{split}.parquet"))
+        k = min(int(float(budget) * n_s1_split), len(ps) - 1)
+        thr_split = max(thr_split, float(ps[k]))
+        print(f"[prune {split}] candidate budget {budget}/S1 -> threshold {thr_split:.4f} (fit threshold {bundle['thr']:.4f})")
     for f in files:
         d = cheap_feats(pd.read_parquet(f), text)
         p = bundle["model"].predict_proba(X_of(d, bundle["feats"]))[:, 1]
-        keep = p >= bundle["thr"]
+        keep = p >= thr_split
         before, after = before + len(d), after + int(keep.sum())
         if "is_true" in d:
             tp_before += int(d["is_true"].sum())
@@ -112,7 +127,10 @@ def cmd_fit(a):
     ids, sample = set(), []
     for f in files:                                     # sample per file: never hold every candidate at once
         x = pd.read_parquet(f)
+        # text for EVERY record (the fitted pruner is applied to all train candidates, holdout included);
+        # only the training sample excludes the locked holdout
         ids.update(x["s1_id"].astype(str)); ids.update(x["cand_id"].astype(str))
+        x = x[~C.is_holdout(x["s1_id"].values)]          # locked holdout never trains the pruner
         if frac < 1.0:
             x = x[pd.util.hash_array(x["s1_id"].values) % 10_000 < int(frac * 10_000)]
         sample.append(x)
@@ -131,10 +149,24 @@ def cmd_fit(a):
         oof[fold == k] = mk().fit(X[fold != k], y[fold != k]).predict_proba(X[fold == k])[:, 1]
     # highest threshold that keeps PRUNE_RECALL of the true pairs blocking found
     ps = np.sort(oof[y == 1])
-    thr = float(ps[int(np.floor((1 - C.PRUNE_RECALL) * len(ps)))]) if len(ps) else 0.0
-    thr = min(thr, C.PRUNE_MAX_THR)
-    keep = oof >= thr
+    thr_recall = float(ps[int(np.floor((1 - C.PRUNE_RECALL) * len(ps)))]) if len(ps) else 0.0
     n_s1 = d["s1_id"].nunique()
+    # candidate budget (smaller candidate sets count in the ranking): lowest threshold giving <= budget per S1
+    budget = float(os.environ.get("BER_PRUNE_MAX_CANDS", "5"))
+    srt = np.sort(oof)[::-1]
+    thr_budget = float(srt[min(int(budget * n_s1), len(srt) - 1)])
+    rec_budget = float((oof[y == 1] >= thr_budget).mean()) if len(ps) else 1.0
+    if thr_budget <= thr_recall:
+        thr = min(thr_recall, max(C.PRUNE_MAX_THR, thr_budget))       # both targets met
+    elif rec_budget >= C.PRUNE_RECALL - 0.0005:
+        thr = thr_budget
+    else:
+        thr = min(thr_recall, C.PRUNE_MAX_THR)
+        print(f"[prune fit] WARNING: <= {budget:g} candidates/S1 would keep only {rec_budget:.4f} of found true "
+              f"pairs (< {C.PRUNE_RECALL}); keeping the recall target (threshold {thr:.4f})")
+    print(f"[prune fit] recall-target threshold {thr_recall:.4f} | budget threshold {thr_budget:.4f} "
+          f"(keeps {rec_budget:.4f}) -> using {thr:.4f}")
+    keep = oof >= thr
     print(f"[prune fit] threshold {thr:.4f}: {len(d) / n_s1:.1f} -> {keep.sum() / n_s1:.1f} candidates per S1, "
           f"true pairs kept {y[keep].sum() / y.sum():.4f} (OOF)")
     bundle = {"model": mk().fit(X, y), "feats": feats, "thr": thr}
