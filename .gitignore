@@ -21,3 +21,5 @@ models/dev/
 remote_pull/
 submissions/
 kaggle_out/
+.claude/settings.local.json
+work_v2/
