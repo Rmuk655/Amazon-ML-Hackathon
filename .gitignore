@@ -23,3 +23,6 @@ submissions/
 kaggle_out/
 .claude/settings.local.json
 work_v2/
+
+# unpacked submission outputs (already inside the zip; candidate_pairs.tsv > GitHub 100 MB limit)
+submission/*/output/*.tsv
