@@ -14,3 +14,15 @@ submission.zip
 # analysis-only (not for submission)
 code/business_entity_resolution/src/profile_data.py
 dataset/processed/eda/
+
+# dev loop / remote helper outputs
+dataset/dev/
+models/dev/
+remote_pull/
+submissions/
+kaggle_out/
+.claude/settings.local.json
+work_v2/
+
+# unpacked submission outputs (already inside the zip; candidate_pairs.tsv > GitHub 100 MB limit)
+submission/*/output/*.tsv

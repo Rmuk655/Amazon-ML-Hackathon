@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 import config as C
 from canonical import name_keys
+from name_clean import NameCleaner, TokenRepair
 from lang_id import NativeLID
 from text_utils import (INDIC_RE, OcrFixer, dominant_indic_script, fold_latin, indic_part, normalize,
                         normalize_address, normalize_name, scripts_present, split_scripts, tokenize)
@@ -100,6 +101,8 @@ def romanize_string(s, dom, lang, cache) -> str:
 
 def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
     df = read_source(src, limit)
+    if os.environ.get("BER_ONLY_COUNTRY"):             # dev: one country only (fast A/B runs)
+        df = df[df["country"].fillna("").str.lower() == os.environ["BER_ONLY_COUNTRY"].lower()].reset_index(drop=True)
     print(f"[{src.name}] {len(df):,} rows")
     for col, fn in FIELDS:
         m = {s: fn(s) for s in df[col].dropna().unique()}
@@ -132,6 +135,14 @@ def process_file(src, dst, lid, xlit, limit=None, dump_vocab=False):
     if OCR is not None:                               # '5ervices' -> 'services' before canonical keys
         u = df["business_name_rom"].unique()
         df["business_name_rom"] = df["business_name_rom"].map(dict(zip(u, map(OCR, u))))
+        if os.environ.get("BER_NAME_CLEAN", "1") != "0":  # aliases, website forms, titles, glued words
+            cleaner = NameCleaner(OCR.vocab)
+            u = df["business_name_rom"].unique()
+            df["business_name_rom"] = df["business_name_rom"].map(dict(zip(u, map(cleaner, u))))
+        if os.environ.get("BER_TOKEN_REPAIR", "1") != "0":   # noisy-channel repair of non-vocabulary tokens
+            rep = TokenRepair(OCR.vocab)
+            u = df["business_name_rom"].unique()
+            df["business_name_rom"] = df["business_name_rom"].map(dict(zip(u, map(rep, u))))
     rn = df["business_name_rom"]
     keys = {s: name_keys(s) for s in rn.unique()}
     for i, k in enumerate(("c4a", "c4b", "legal")):

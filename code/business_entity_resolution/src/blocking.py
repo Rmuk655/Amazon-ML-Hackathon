@@ -30,6 +30,7 @@ K_PER_SOURCE per S1 and per source (S2 / S3) are kept.
 Partitions by country_norm (generic string label, nothing hard-coded); --cross-country to disable.
 """
 import argparse
+import gc
 import os
 import re
 import time
@@ -59,6 +60,11 @@ def skel(tok: str) -> str:
     return s or tok
 
 
+_STREET_WORDS = {"road", "street", "lane", "avenue", "nagar", "floor", "building", "near", "opposite", "sector",
+                 "plot", "flat", "house", "shop", "office", "block", "phase", "main", "cross", "colony", "drive",
+                 "court", "place", "suite", "apartment", "complex", "tower", "rue", "boulevard", "chemin", "allée"}
+
+
 def record_keys(name: str, addr: str):
     out = []
     t = name.split() if name else []
@@ -77,9 +83,19 @@ def record_keys(name: str, addr: str):
     out.append((KT["pre"], "F|" + "|".join(w[:4] for w in t[:2])))
     for i in range(min(len(t) - 1, 3)):
         out.append((KT["join"], "J|" + t[i] + t[i + 1]))
+    if C.NEW_KEYS:
+        for i in range(min(len(t) - 2, 2)):                # 3-word glue (generator glues 2-3 words)
+            out.append((KT["join"], "J|" + t[i] + t[i + 1] + t[i + 2]))
+        if 2 <= len(t) <= 5:
+            out.append((KT["join"], "J|" + "".join(t)))    # whole name glued ('agroshreedevelopers')
     for w in t:
         if len(w) >= 8:
             out.append((KT["join"], "J|" + w))
+    if C.NEW_KEYS and len(t) >= 2:                         # word order invariant (reordered names)
+        out.append((KT["sorted"], "S|" + " ".join(sorted(set(t)))))
+        out.append((KT["acro"], "I|" + "".join(w[0] for w in t)))   # acronym side: initials of the name
+    elif C.NEW_KEYS and 2 <= len(t[0]) <= 5 and t[0].isalpha():
+        out.append((KT["acro"], "I|" + t[0]))              # a short one-word name may be an acronym
     if addr:
         a = addr.split()
         for pc in [w for w in a if w.isdigit() and 5 <= len(w) <= 6][:2]:
@@ -89,6 +105,22 @@ def record_keys(name: str, addr: str):
             out.append((KT["nameaddr"], f"N|{sk[0]}|{w}"))
         for i in range(min(len(a) - 1, 2)):
             out.append((KT["addrbi"], f"B|{a[i]}|{a[i + 1]}"))
+        # address-only key (house number + first street word, any order): finds records whose name was
+        # replaced entirely ('rose infocom partners' -> 'fayelum') when the address parts are reordered
+        house = next((w for w in a if w[:1].isdigit() and len(w) <= 6), None)
+        street = next((w for w in a if w.isalpha() and len(w) >= 4 and w not in _STREET_WORDS), None)
+        if C.ADDR_KEY and house and street:
+            out.append((KT["addrbi"], f"H|{house}|{street}"))
+        # dropped / added words (32% of true pairs differ only that way): every core word and every pair of core
+        # words, anchored by the house number (or first street word), so any surviving subset of the name still meets
+        anchor = house or street
+        if C.SUBSET_KEYS and anchor and t:
+            core_w = [w for w in dict.fromkeys(t) if len(w) >= 3][:5]
+            for w in core_w:
+                out.append((KT["subset"], f"U|{w}|{anchor}"))
+            for i in range(len(core_w)):
+                for j in range(i + 1, len(core_w)):
+                    out.append((KT["subset"], f"U|{core_w[i]}|{core_w[j]}|{anchor}"))
     return out
 
 
@@ -182,20 +214,18 @@ def group_ctx(key, score):
 
 
 def add_context(files, parts):
-    """Ambiguity features over a whole country partition, written back into its part files.
-    fwd_*: among this S1's candidates from the same source; rev_*: among all S1 entities that
-    proposed this target (the reverse direction - only visible once every S1 chunk is done)."""
+    """Reverse ambiguity features over a whole country partition, written back into its part files:
+    rev_*: among all S1 entities that proposed this target (only visible once every S1 chunk is done).
+    The forward ones (fwd_*: among this S1's candidates from the same source) are computed per chunk."""
     if not parts:
         return
-    s = np.concatenate([p[0] for p in parts]); t = np.concatenate([p[1] for p in parts])
-    src = np.concatenate([p[2] for p in parts]); v = np.concatenate([p[3] for p in parts])
-    _, fn, fm = group_ctx(s * 4 + src, v)
+    t = np.concatenate([p[0] for p in parts]); v = np.concatenate([p[1] for p in parts])
     rr, rn, rm = group_ctx(t, v)
+    del t, v
     a = 0
     for f, p in zip(files, parts):
         b = a + len(p[0])
         d = pd.read_parquet(f)
-        d["fwd_n"], d["fwd_margin"] = fn[a:b].astype(np.int16), fm[a:b].astype(np.float32)
         d["rev_rank"], d["rev_n"], d["rev_margin"] = (rr[a:b].astype(np.int16), rn[a:b].astype(np.int32),
                                                       rm[a:b].astype(np.float32))
         d.to_parquet(f, index=False)
@@ -303,6 +333,9 @@ def run(args):
     S1 = load(args.split, 1)
     if args.limit_s1:
         S1 = S1.head(args.limit_s1)
+    if args.s1_address_tokens:     # dev: only S1 whose address contains one of these tokens (e.g. states)
+        want = set(args.s1_address_tokens)
+        S1 = S1[S1["business_address_rom"].fillna("").map(lambda a: not want.isdisjoint(a.split()))]
     T = pd.concat([load(args.split, 2).assign(src=2), load(args.split, 3).assign(src=3)], ignore_index=True)
     for df in (S1, T):
         df["business_name_c4b"] = df["business_name_c4b"].fillna("")
@@ -325,8 +358,9 @@ def run(args):
         f.unlink()
 
     if C.WITHIN_COUNTRY and not args.cross_country:
-        parts = [(c, S1[S1.country_norm == c].reset_index(drop=True), T[T.country_norm == c].reset_index(drop=True))
-                 for c in sorted(S1.country_norm.unique()) if not args.countries or c in args.countries]
+        # built one country at a time (generator) so only the current partition is held in memory
+        parts = ((c, S1[S1.country_norm == c].reset_index(drop=True), T[T.country_norm == c].reset_index(drop=True))
+                 for c in sorted(S1.country_norm.unique()) if not args.countries or c in args.countries)
     else:
         parts = [("all", S1.reset_index(drop=True), T)]
 
@@ -379,7 +413,16 @@ def run(args):
                 cand["is_true"] = (codes[pos] == cand["pid"].to_numpy()) if len(codes) else False
                 for s in (2, 3):
                     st.pre_trunc[s] += int(((cand.is_true) & (cand.src == s)).sum())
-            cand = cand[(cand["rank"] < args.k) | (cand["tf_rank"] < C.TFIDF_K)].reset_index(drop=True)
+            # reverse top-K_REV: this target's best S1 entities in this chunk (a superset of its global top)
+            cand["t_rank"] = (cand.groupby("t")["score"].rank(method="first", ascending=False) - 1).to_numpy(np.int16)
+            keep = (cand["rank"] < args.k) | (cand["tf_rank"] < C.TFIDF_K) | (cand["t_rank"] < C.K_REV)
+            if C.BYPASS_KEYS:                                # exact core name + an address key: never cut
+                mk = cand["mask"].to_numpy().astype(np.int64)
+                core_hit = (mk >> KT["core"]) & 1 == 1
+                addr_hit = ((mk >> KT["nameaddr"]) & 1 == 1) | ((mk >> KT["addrbi"]) & 1 == 1)
+                keep |= core_hit & addr_hit
+            cand = cand[keep]
+            cand = cand.reset_index(drop=True)
             if A is not None:
                 cand["tf_cos"] = tfc.cos(A, cand["s"].to_numpy() - a, cand["t"].to_numpy())
             st.n_pairs += len(cand)
@@ -401,18 +444,24 @@ def run(args):
             out = pd.DataFrame({
                 "s1_id": s1_ids[cand["s"].to_numpy()], "cand_id": t_ids[cand["t"].to_numpy()],
                 "src": cand["src"].to_numpy(np.int8), "score": cand["score"].to_numpy(),
-                "mask": cand["mask"].to_numpy(np.int16), "rank": cand["rank"].to_numpy(np.int8)})
+                "mask": cand["mask"].to_numpy(np.int16), "rank": cand["rank"].to_numpy(np.int16),
+                "t_rank": cand["t_rank"].to_numpy(np.int16)})
             if "tf_cos" in cand.columns:
                 out["tf_cos"] = cand["tf_cos"].to_numpy(np.float32)
                 out["tf_rank"] = cand["tf_rank"].to_numpy(np.int8)
             if codes is not None:
                 out["is_true"] = cand["is_true"].to_numpy(np.int8)
+            # forward context: an S1's candidates all sit in this chunk, so compute it here
+            _, fn, fm = group_ctx(cand["s"].to_numpy(np.int64) * 4 + cand["src"].to_numpy(np.int64),
+                                  cand["score"].to_numpy(np.float32))
+            out["fwd_n"], out["fwd_margin"] = fn.astype(np.int16), fm.astype(np.float32)
             f = outdir / f"part-{pname}-{a // C.S1_CHUNK:04d}.parquet"
             out.to_parquet(f, index=False)
             ctx_files.append(f)
-            ctx_parts.append((cand["s"].to_numpy(np.int64), cand["t"].to_numpy(np.int64),
-                              cand["src"].to_numpy(np.int64), cand["score"].to_numpy(np.float32)))
+            ctx_parts.append((cand["t"].to_numpy(np.int32), cand["score"].to_numpy(np.float32)))
             print(f"   chunk {a // C.S1_CHUNK}: {len(out):,} pairs ({time.time() - t0:.0f}s)")
+        index = tfc = A = None                     # free the target index before the reverse pass
+        gc.collect()
         add_context(ctx_files, ctx_parts)
         del ctx_parts
 
@@ -474,6 +523,7 @@ def main():
     ap.add_argument("--countries", nargs="*", help="only these country_norm values (memory control)")
     ap.add_argument("--cross-country", action="store_true")
     ap.add_argument("--limit-s1", type=int, default=None, help="dev: first N S1 rows")
+    ap.add_argument("--s1-address-tokens", nargs="*", help="dev: keep S1 whose address has one of these tokens")
     ap.add_argument("--write-tsv", action="store_true")
     run(ap.parse_args())
 
