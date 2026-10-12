@@ -31,5 +31,5 @@ echo "  outputs landed: $(find submissions/emb -name 'nn_*.parquet' 2>/dev/null 
 LP=$(cat ~/launch_run8.pid 2>/dev/null); echo "--- run-8 launcher: PID ${LP:-none} $(ps -p ${LP:-0} > /dev/null 2>&1 && echo running || echo NOT running)"
 tail -2 ~/launch_run8.log 2>/dev/null | sed 's/^/    /'
 echo "--- submissions (S3)"
-$A s3 ls s3://sagemaker-us-east-1-134051031272/ber/ --recursive 2>/dev/null | grep -E "submission|results|eda_results|run5p|run7|run8" | tail -12
+$A s3 ls s3://${BER_BUCKET:?set BER_BUCKET}/ber/ --recursive 2>/dev/null | grep -E "submission|results|eda_results|run5p|run7|run8" | tail -12
 echo "--- submissions (local)"; ls -la submissions/*.zip 2>/dev/null
