@@ -60,4 +60,3 @@ The dataset is not included; place it as `dataset/train/*.tsv` and `dataset/test
 ## Notes
 
 - CPU only; no external data and no pretrained models in the v2 pipeline.
-- Developed with an AI coding assistant for implementation and experiment orchestration; problem analysis and decisions were directed by the author.
