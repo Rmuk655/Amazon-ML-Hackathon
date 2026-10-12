@@ -12,6 +12,17 @@ Every S2/S3 record belongs to at most one S1 business, so the problem is solved 
 4. **Matching** with a two-pass LightGBM model on about 55 pair features. Pass 2 is *collective*: it adds features computed from the tentative cluster of records assigned to the same S1.
 5. **Decision**: argmax S1 if probability is above a threshold tuned on out-of-fold macro F0.5, with false positives weighted x2 to mimic the denser decoys in the test set.
 
+```mermaid
+flowchart LR
+  R["S2 / S3 records"] --> N[Normalise + learned lexicon]
+  N --> B["Blocking: 5 TF-IDF channels"]
+  B --> P["Pruner: LightGBM, at most 6 candidates"]
+  P --> M1["Pass 1 matcher: LightGBM"]
+  M1 --> M2["Pass 2: collective cluster features"]
+  M2 --> D["Threshold + exclusive assignment"]
+  D --> O["matching_results.tsv"]
+```
+
 ## Results
 
 Measured on a locked holdout (10% of train S1 entities, never used for fitting or tuning):
