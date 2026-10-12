@@ -7,8 +7,8 @@
 # current code to ~/ber8 and the neighbour files to ~/embed, and runs run8.sh (which stops the instance at the end).
 # Gives up (no launch) if the embeddings are not complete by CUTOFF - run 8 would only duplicate run 7.
 cd "$(dirname "$0")/../.."
-ROOT=$(pwd); A=$ROOT/venv/bin/aws; PY=$ROOT/venv/bin/python; KEY=~/.ssh/claude-ber.pem; I=i-0076c2fcc9a8df3ab
-S3=s3://sagemaker-us-east-1-134051031272/ber; EMB=$ROOT/submissions/emb
+ROOT=$(pwd); A=$ROOT/venv/bin/aws; PY=$ROOT/venv/bin/python; KEY=~/.ssh/claude-ber.pem; I=${BER_INSTANCE:?set BER_INSTANCE to the EC2 instance id}
+S3=s3://${BER_BUCKET:?set BER_BUCKET to the S3 bucket}/ber; EMB=$ROOT/submissions/emb
 CUTOFF=${CUTOFF:-"2026-09-27 11:00"}
 echo $$ > ~/launch_run8.pid; exec >> ~/launch_run8.log 2>&1
 log() { echo "[$(date '+%a %H:%M')] $*"; }
@@ -36,10 +36,11 @@ TMP=$(mktemp -d)
 tar -czf $TMP/code.tgz --exclude=__pycache__ --exclude=logs code/business_entity_resolution Documentation_template.md
 tar -czf $TMP/embed.tgz -C $EMB $(cd $EMB && find . -name 'nn_*.parquet')
 $PY - > $TMP/urls.env <<'EOF'
+import os
 import boto3
 s3 = boto3.client("s3", region_name="us-east-1")
 for n, k in (("URL_sub8", "ber/run8-2026-09-27/submission8.zip"), ("URL_run8_logs", "ber/run8-2026-09-27/run8_logs.tgz")):
-    print(f"{n}='" + s3.generate_presigned_url("put_object", Params={"Bucket": "sagemaker-us-east-1-134051031272", "Key": k}, ExpiresIn=3 * 24 * 3600) + "'")
+    print(f"{n}='" + s3.generate_presigned_url("put_object", Params={"Bucket": os.environ["BER_BUCKET"], "Key": k}, ExpiresIn=3 * 24 * 3600) + "'")
 EOF
 scp -q -i $KEY $TMP/code.tgz $TMP/embed.tgz $TMP/urls.env ubuntu@$IP:~/ && ssh -i $KEY ubuntu@$IP '
   mkdir -p ~/ber8 ~/embed && tar -xzf ~/code.tgz -C ~/ber8 && tar -xzf ~/embed.tgz -C ~/embed

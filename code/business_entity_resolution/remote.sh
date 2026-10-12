@@ -12,14 +12,14 @@
 #   ./remote.sh stop                   stop (not terminate) the instance: disk and intermediates are kept
 #
 # Settings (env): BER_INSTANCE (instance id; default: the one tagged Name=claude-ber-cpu),
-#                 BER_KEY (~/.ssh/claude-ber.pem), BER_BUCKET (sagemaker-us-east-1-134051031272)
+#                 BER_KEY (~/.ssh/claude-ber.pem), BER_BUCKET (required: S3 bucket for artifacts)
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 AWS=${AWS:-$ROOT/venv/bin/aws}
 PY=${PY:-$ROOT/venv/bin/python}
 KEY=${BER_KEY:-$HOME/.ssh/claude-ber.pem}
-BUCKET=${BER_BUCKET:-sagemaker-us-east-1-134051031272}
+BUCKET=${BER_BUCKET:?set BER_BUCKET to the S3 bucket used for artifacts}
 ID=${BER_INSTANCE:-$($AWS ec2 describe-instances --filters Name=tag:Name,Values=claude-ber-cpu \
      Name=instance-state-name,Values=pending,running,stopping,stopped \
      --query 'Reservations[0].Instances[0].InstanceId' --output text)}
