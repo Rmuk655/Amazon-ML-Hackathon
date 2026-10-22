@@ -1,5 +1,5 @@
 #!/bin/bash
-# Laptop-side launcher for run 8 (detached; survives the Claude session):
+# Laptop-side launcher for run 8 (detached; survives the terminal session):
 #   setsid nohup code/business_entity_resolution/launch_run8.sh > /dev/null 2>&1 &
 # PID ~/launch_run8.pid, log ~/launch_run8.log.
 # Waits until (a) run 7 has finished (instance stopped and run7 artifacts in S3) and (b) the Kaggle bi-encoder
