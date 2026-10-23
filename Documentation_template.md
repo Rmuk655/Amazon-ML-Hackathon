@@ -14,7 +14,7 @@ per-S1 match lists are the union of these assignments. A second, **collective** 
 the other records tentatively assigned to the same S1. The pipeline uses only the provided data: no external lookups,
 no pretrained models (all models are LightGBM trained from scratch), and CPU only.
 
-Locked-holdout macro F0.5 (10% of train S1 entities, 220,656 S1s, never used for any fitting or tuning): **0.9851** (pair precision 0.997, recall 0.965; singletons 0.988). It is 0.9844 when decoy false positives are doubled to match test density.
+Locked-holdout macro F0.5 (10% of train S1 entities, 220,656 S1s, never used for fitting, calibration or threshold tuning; with the stacked-ensemble option on, it is also used once to decide whether the ensemble is kept): **0.9851** (pair precision 0.997, recall 0.965; singletons 0.988). It is 0.9844 when decoy false positives are doubled to match test density.
 
 ---
 

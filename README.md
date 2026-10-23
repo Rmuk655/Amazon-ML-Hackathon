@@ -25,7 +25,7 @@ flowchart LR
 
 ## Results
 
-Measured on a locked holdout (10% of train S1 entities, never used for fitting or tuning):
+Measured on a locked holdout (10% of train S1 entities, never used for fitting, calibration or threshold tuning; with the stacked-ensemble option on, it is also used once to decide whether the ensemble is kept):
 
 | Stage | Macro F0.5 | Precision / Recall |
 |---|---|---|
