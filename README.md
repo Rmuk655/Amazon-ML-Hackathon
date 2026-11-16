@@ -10,7 +10,8 @@ Every S2/S3 record belongs to at most one S1 business, so the problem is solved 
 2. **Blocking** with five TF-IDF channels (name, address, combined, composite name x address, same-name key) to retrieve candidate S1 businesses per record. Composite and same-name keys were needed because at full scale common names tie on plain name similarity.
 3. **Pruning** with a cross-fitted LightGBM to at most 6 candidates per record.
 4. **Matching** with a two-pass LightGBM model on about 55 pair features. Pass 2 is *collective*: it adds features computed from the tentative cluster of records assigned to the same S1.
-5. **Decision**: argmax S1 if probability is above a threshold tuned on out-of-fold macro F0.5, with false positives weighted x2 to mimic the denser decoys in the test set.
+5. **Cross-encoder stack (final submission)**: a fine-tuned multilingual cross-encoder (`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`, trained on Kaggle GPUs) scores raw name and address text of each pair; a stacked LightGBM combines it with the pass-2 score. Details in `submission/submission_xe1_raw_pp_c5/Documentation_template.md`.
+6. **Decision**: argmax S1 if probability is above a threshold tuned on out-of-fold macro F0.5, with false positives weighted x2 to mimic the denser decoys in the test set.
 
 ```mermaid
 flowchart LR
@@ -19,7 +20,8 @@ flowchart LR
   B --> P["Pruner: LightGBM, at most 6 candidates"]
   P --> M1["Pass 1 matcher: LightGBM"]
   M1 --> M2["Pass 2: collective cluster features"]
-  M2 --> D["Threshold + exclusive assignment"]
+  M2 --> X["Cross-encoder stack"]
+  X --> D["Threshold + exclusive assignment"]
   D --> O["matching_results.tsv"]
 ```
 
@@ -31,9 +33,10 @@ Measured on a locked holdout (10% of train S1 entities, never used for fitting, 
 |---|---|---|
 | Blocking + pruning | pair recall 0.9813 | |
 | Pass 1 | 0.9810 | 0.995 / 0.955 |
-| Pass 2 (collective) | **0.9851** | 0.997 / 0.965 |
+| Pass 2 (collective) | 0.9851 | 0.997 / 0.965 |
+| Pass 2 + cross-encoder stack | **0.9889** | 0.9985 / 0.970 |
 
-These are local holdout numbers, not leaderboard scores. The earlier v1 pipeline scored 0.943 on the public leaderboard at its best.
+The first three rows are from `Documentation_template.md`, the stacked row from `submission/submission_xe1_raw_pp_c5/Documentation_template.md`, which also reports leaderboard scores: 0.975 without the cross-encoder and 0.983 with it.
 
 Lesson from the project: a 10% development slice showed 0.997 blocking recall, but the full data dropped it to about 0.95, because common names tie and exceed document-frequency caps. Measuring at full scale and adding composite keys fixed it.
 
@@ -59,4 +62,4 @@ The dataset is not included; place it as `dataset/train/*.tsv` and `dataset/test
 
 ## Notes
 
-- CPU only; no external data and no pretrained models in the v2 pipeline.
+- The LightGBM pipeline runs on CPU with no external data. The cross-encoder stack starts from one pretrained checkpoint and was fine-tuned on GPUs (see above); `code/business_entity_resolution/kaggle/` holds its kernels.
