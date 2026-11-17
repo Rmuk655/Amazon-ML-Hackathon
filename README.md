@@ -50,6 +50,12 @@ Lesson from the project: a 10% development slice showed 0.997 blocking recall, b
 | `amazon-ml-challenge-eda.ipynb` | Exploratory data analysis |
 | `utils/` | Official submission validator |
 
+## Setup
+
+Ubuntu/WSL with sudo: `bash setup.sh` installs build tools, creates `.venv` (Python 3.12) and installs the pinned pipeline requirements (`FULL=1 bash setup.sh` also installs the root `requirements.txt`; `WITH_MODELS=1 bash setup.sh` also downloads the IndicLID FTN language-ID model, 160 MB, from the official [AI4Bharat/IndicLID release](https://github.com/AI4Bharat/IndicLID/releases/tag/v1.0)). Then `source .venv/bin/activate`.
+
+Optional pieces, all documented in `setup.sh`: the Qwen2.5-1.5B-Instruct Q4_K_M GGUF (`Qwen/Qwen2.5-1.5B-Instruct-GGUF` on Hugging Face, about 1.1 GB) for `src/second_look.py`, and `ai4bharat-transliteration` (on PyPI; needs Python 3.9 and numpy<1.24, run separately, source [AI4Bharat/IndicXlit](https://github.com/AI4Bharat/IndicXlit)). The competition dataset has no public mirror: TODO, download it from the challenge portal.
+
 ## Reproduce
 
 ```bash
