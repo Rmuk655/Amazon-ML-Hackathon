@@ -33,3 +33,4 @@ submission/*/output/*.tsv
 graphify-out/
 .vscode/
 .tools/
+.venv-xlit/

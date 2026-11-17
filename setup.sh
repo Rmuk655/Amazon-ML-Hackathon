@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Setup for Ubuntu/WSL: build tools, Python 3.12 venv, pinned pipeline deps.
-# Run:  bash setup.sh          (WITH_MODELS=1 also fetches the IndicLID model; FULL=1 bash setup.sh also installs the root requirements.txt: torch, faiss, llama-cpp, ...)
+# Run:  bash setup.sh          (WITH_MODELS=1 also fetches the IndicLID and Qwen models and the IndicXlit venv; FULL=1 bash setup.sh also installs the root requirements.txt: torch, faiss, llama-cpp, ...)
 # Then (from README.md):
 #   cd code/business_entity_resolution && PYTHON=../../.venv/bin/python BER_WORKERS=8 ./run_v2.sh   # about 4 h on 8 vCPU / 64 GB
 set -euo pipefail
@@ -31,12 +31,19 @@ u = "https://github.com/AI4Bharat/IndicLID/releases/download/v1.0/indiclid-ftn.z
 zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(u).read())).extractall(sys.argv[1])
 PY
 fi
-# Optional Qwen2.5-1.5B-Instruct Q4_K_M GGUF (about 1.1 GB) for src/second_look.py (path via BER_LLM):
-#   .venv/bin/pip install huggingface_hub
-#   .venv/bin/huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct-GGUF qwen2.5-1.5b-instruct-q4_k_m.gguf --local-dir models/llm
-# Optional IndicXlit transliteration (ai4bharat-transliteration is on PyPI, v1.1.3, but needs Python 3.9 and numpy<1.24;
-# the pipeline runs it separately via code/business_entity_resolution/colab/translit_colab.ipynb):
-#   pip install "numpy<1.24" ai4bharat-transliteration    (source: https://github.com/AI4Bharat/IndicXlit)
-# WITH_MODELS=1 bash setup.sh downloads only the IndicLID model above.
+if [ "${WITH_MODELS:-0}" = "1" ]; then
+  # Qwen2.5-1.5B-Instruct Q4_K_M GGUF (about 1.1 GB) for src/second_look.py; default path models/llm/ (override with BER_LLM).
+  if [ ! -f models/llm/qwen2.5-1.5b-instruct-q4_k_m.gguf ]; then
+    .venv/bin/pip install huggingface_hub
+    .venv/bin/python -c "from huggingface_hub import hf_hub_download; hf_hub_download('Qwen/Qwen2.5-1.5B-Instruct-GGUF', 'qwen2.5-1.5b-instruct-q4_k_m.gguf', local_dir='models/llm')"
+  fi
+  # IndicXlit transliteration (source: https://github.com/AI4Bharat/IndicXlit). ai4bharat-transliteration needs
+  # Python 3.9 and numpy<1.24, so it gets its own venv; uv downloads Python 3.9. Used by colab/translit_colab.ipynb.
+  if [ ! -d .venv-xlit ]; then
+    .venv/bin/pip install uv
+    .venv/bin/uv venv --python 3.9 .venv-xlit
+    .venv/bin/uv pip install --python .venv-xlit/bin/python "numpy<1.24" ai4bharat-transliteration
+  fi
+fi
 [ -d dataset/train ] || echo "WARNING: dataset/train missing (see TODO above)."
 echo "Done. Activate with: source .venv/bin/activate"
