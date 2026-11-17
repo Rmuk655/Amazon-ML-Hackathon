@@ -17,8 +17,8 @@ if [ "${FULL:-0}" = "1" ]; then
 fi
 
 # Dataset: NOT public in this repo. It is the Amazon ML Challenge 2026 (Business Entity Resolution) release.
-# TODO: no public mirror found (Hugging Face/Kaggle search by name gave nothing official); download it from the
-# challenge portal you registered on and place it as dataset/train/*.tsv and dataset/test/*.tsv.
+# Download it as a registered participant from https://unstop.com/hackathons/crp-amazon-ml-challenge-2026-amazon-1743604
+# and place it as dataset/train/*.tsv and dataset/test/*.tsv (see README).
 
 # Optional IndicLID language-ID model (native-script fastText "FTN", 160 MB), official GitHub release; the pipeline
 # falls back to script-default languages without it. Needs: pip install fasttext-wheel "numpy<2" (separate venv).
@@ -45,5 +45,5 @@ if [ "${WITH_MODELS:-0}" = "1" ]; then
     .venv/bin/uv pip install --python .venv-xlit/bin/python "numpy<1.24" ai4bharat-transliteration
   fi
 fi
-[ -d dataset/train ] || echo "WARNING: dataset/train missing (see TODO above)."
+[ -d dataset/train ] || echo "WARNING: dataset/train missing (see README)."
 echo "Done. Activate with: source .venv/bin/activate"

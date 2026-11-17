@@ -54,7 +54,7 @@ Lesson from the project: a 10% development slice showed 0.997 blocking recall, b
 
 Ubuntu/WSL with sudo: `bash setup.sh` installs build tools, creates `.venv` (Python 3.12) and installs the pinned pipeline requirements (`FULL=1 bash setup.sh` also installs the root `requirements.txt`; `WITH_MODELS=1 bash setup.sh` also downloads the IndicLID FTN language-ID model, 160 MB, from the official [AI4Bharat/IndicLID release](https://github.com/AI4Bharat/IndicLID/releases/tag/v1.0)). Then `source .venv/bin/activate`.
 
-Optional pieces, all documented in `setup.sh`: the Qwen2.5-1.5B-Instruct Q4_K_M GGUF (`Qwen/Qwen2.5-1.5B-Instruct-GGUF` on Hugging Face, about 1.1 GB) for `src/second_look.py`, and `ai4bharat-transliteration` (on PyPI; needs Python 3.9 and numpy<1.24, run separately, source [AI4Bharat/IndicXlit](https://github.com/AI4Bharat/IndicXlit)). The competition dataset has no public mirror: TODO, download it from the challenge portal.
+Optional pieces, all documented in `setup.sh`: the Qwen2.5-1.5B-Instruct Q4_K_M GGUF (`Qwen/Qwen2.5-1.5B-Instruct-GGUF` on Hugging Face, about 1.1 GB) for `src/second_look.py`, and `ai4bharat-transliteration` (on PyPI; needs Python 3.9 and numpy<1.24, run separately, source [AI4Bharat/IndicXlit](https://github.com/AI4Bharat/IndicXlit)).
 
 ## Reproduce
 
@@ -64,7 +64,7 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt      # Python 3
 PYTHON=venv/bin/python BER_WORKERS=8 ./run_v2.sh                      # about 4 h on 8 vCPU / 64 GB
 ```
 
-The dataset is not included; place it as `dataset/train/*.tsv` and `dataset/test/*.tsv` next to `code/`.
+The dataset is not included (Amazon competition data, not redistributable). Download it as a registered participant from the [Amazon ML Challenge 2026 page on Unstop](https://unstop.com/hackathons/crp-amazon-ml-challenge-2026-amazon-1743604) and place it as `dataset/train/*.tsv` and `dataset/test/*.tsv` next to `code/`.
 
 ## Notes
 
